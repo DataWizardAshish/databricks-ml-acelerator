@@ -4,12 +4,10 @@ WorkspaceContext is carried through every node so all tools use the
 same per-request credentials. Never read from global settings inside nodes.
 """
 
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 from typing_extensions import TypedDict
 
-if TYPE_CHECKING:
-    from tools.workspace_context import WorkspaceContext
-
+from tools.workspace_context import WorkspaceContext
 from tools.uc_reader import TableInfo
 
 
@@ -28,7 +26,7 @@ class MLOpportunity(TypedDict):
 
 class AgentState(TypedDict):
     # Per-request workspace connection (host, token, catalog, schema)
-    workspace: "WorkspaceContext"
+    workspace: WorkspaceContext
 
     # Discovery results
     tables: list[TableInfo]

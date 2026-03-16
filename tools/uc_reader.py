@@ -5,12 +5,11 @@ Accepts a WorkspaceContext so each request can target a different workspace.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
 from databricks.sdk.service.catalog import TableType
 
-if TYPE_CHECKING:
-    from tools.workspace_context import WorkspaceContext
+from tools.workspace_context import WorkspaceContext
 
 
 @dataclass
@@ -49,7 +48,7 @@ class UCReader:
     Never reads actual row data — metadata APIs only.
     """
 
-    def __init__(self, ctx: "WorkspaceContext") -> None:
+    def __init__(self, ctx: WorkspaceContext) -> None:
         self._ctx = ctx
         self._client = ctx.get_workspace_client()
 
