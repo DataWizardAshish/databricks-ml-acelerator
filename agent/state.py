@@ -1,30 +1,32 @@
 """
 LangGraph state for the ML Accelerator agent pipeline.
+WorkspaceContext is carried through every node so all tools use the
+same per-request credentials. Never read from global settings inside nodes.
 """
 
 from typing import Optional
 from typing_extensions import TypedDict
 
+from tools.workspace_context import WorkspaceContext
 from tools.uc_reader import TableInfo
 
 
 class MLOpportunity(TypedDict):
     rank: int
-    use_case: str                # e.g. "Customer Churn Prediction"
-    target_table: str            # full UC table name
-    target_column: str           # predicted column
-    feature_tables: list[str]    # supporting tables
-    ml_type: str                 # classification | regression | clustering | forecasting
-    estimated_auc_range: str     # e.g. "75–82%"
-    business_value: str          # 1–2 sentence business impact
-    complexity: str              # low | medium | high
-    rationale: str               # why this opportunity exists in this data
+    use_case: str
+    target_table: str
+    target_column: str
+    feature_tables: list[str]
+    ml_type: str                  # classification | regression | clustering | forecasting
+    estimated_auc_range: str
+    business_value: str
+    complexity: str               # low | medium | high
+    rationale: str
 
 
 class AgentState(TypedDict):
-    # Inputs
-    catalog: str
-    schema: str
+    # Per-request workspace connection (host, token, catalog, schema)
+    workspace: WorkspaceContext
 
     # Discovery results
     tables: list[TableInfo]

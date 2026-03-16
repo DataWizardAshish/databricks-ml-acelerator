@@ -1,0 +1,5 @@
+# Job YAML definitions are generated here by the Phase 2 code generation agent.
+# Each approved ML use case gets:
+#   - {use_case}_feature_pipeline_job.yml
+#   - {use_case}_training_job.yml
+#   - {use_case}_batch_inference_job.yml
