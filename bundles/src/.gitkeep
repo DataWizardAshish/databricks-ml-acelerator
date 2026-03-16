@@ -1,0 +1,7 @@
+# Generated notebooks land here per use case:
+#   src/{use_case_name}/01_feature_engineering.py
+#   src/{use_case_name}/02_training.py
+#   src/{use_case_name}/03_batch_inference.py
+#
+# All notebooks use Databricks notebook format (# Databricks notebook source)
+# and are parameterized via dbutils.widgets — safe for both interactive and job execution.
