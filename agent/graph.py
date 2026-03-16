@@ -76,16 +76,19 @@ def _get_graph():
 # ── Graph state snapshot helper ──────────────────────────────────────────────
 
 def _snapshot_to_status(snapshot) -> str:
-    """Map the current graph position to a user-facing status string."""
+    """
+    Map the current graph position to a user-facing status string.
+    When interrupt() is called inside a node, snapshot.next == [that_node_name].
+    """
     if not snapshot or not snapshot.values:
         return "not_found"
     if not snapshot.next:
         return "completed"
     next_node = snapshot.next[0] if snapshot.next else ""
-    if next_node == "plan_features":
-        return "awaiting_approval"         # paused at human_checkpoint (opp approval)
-    if next_node == "write_bundle":
-        return "awaiting_code_review"      # paused at human_checkpoint_code
+    if next_node == "human_checkpoint":
+        return "awaiting_approval"         # interrupted inside human_checkpoint
+    if next_node == "human_checkpoint_code":
+        return "awaiting_code_review"      # interrupted inside human_checkpoint_code
     return "running"
 
 
