@@ -1,12 +1,20 @@
 """
-LangGraph graph for Phase 1: Discovery + Recommendation.
+LangGraph graph — Phase 1 + Phase 2.
 
-Graph:
-  START → discover_catalog → analyze_estate → rank_opportunities → human_checkpoint → END
+Full graph:
+  START
+    → discover_catalog
+    → analyze_estate
+    → rank_opportunities
+    → human_checkpoint          ⏸ approve opportunity
+    → plan_features
+    → generate_code
+    → human_checkpoint_code     ⏸ review generated notebooks
+    → write_bundle
+  END
 """
 
 import logging
-from typing import Optional
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -14,32 +22,46 @@ from langgraph.types import Command
 
 from agent.state import AgentState
 from agent.nodes import discover_catalog, analyze_estate, rank_opportunities, human_checkpoint
+from agent.code_gen_nodes import plan_features, generate_code, human_checkpoint_code, write_bundle
 from tools.workspace_context import WorkspaceContext, validate_workspace
 
 logger = logging.getLogger(__name__)
 
-# Module-level graph + checkpointer (MemorySaver for local dev)
 _checkpointer = MemorySaver()
 _graph = None
 
 
 def build_graph(checkpointer=None):
     """
-    Build and compile the Phase 1 agent graph.
-    Pass a Delta-based checkpointer for production Databricks Apps deployment.
+    Build and compile the full agent graph (Phase 1 + Phase 2).
+    Swap MemorySaver for a Delta-backed checkpointer for Databricks Apps production.
     """
     builder = StateGraph(AgentState)
 
+    # Phase 1 nodes
     builder.add_node("discover_catalog", discover_catalog)
     builder.add_node("analyze_estate", analyze_estate)
     builder.add_node("rank_opportunities", rank_opportunities)
     builder.add_node("human_checkpoint", human_checkpoint)
 
+    # Phase 2 nodes
+    builder.add_node("plan_features", plan_features)
+    builder.add_node("generate_code", generate_code)
+    builder.add_node("human_checkpoint_code", human_checkpoint_code)
+    builder.add_node("write_bundle", write_bundle)
+
+    # Edges — Phase 1
     builder.add_edge(START, "discover_catalog")
     builder.add_edge("discover_catalog", "analyze_estate")
     builder.add_edge("analyze_estate", "rank_opportunities")
     builder.add_edge("rank_opportunities", "human_checkpoint")
-    builder.add_edge("human_checkpoint", END)
+
+    # Edges — Phase 1 → Phase 2
+    builder.add_edge("human_checkpoint", "plan_features")
+    builder.add_edge("plan_features", "generate_code")
+    builder.add_edge("generate_code", "human_checkpoint_code")
+    builder.add_edge("human_checkpoint_code", "write_bundle")
+    builder.add_edge("write_bundle", END)
 
     return builder.compile(checkpointer=checkpointer or _checkpointer)
 
@@ -49,6 +71,25 @@ def _get_graph():
     if _graph is None:
         _graph = build_graph()
     return _graph
+
+
+# ── Graph state snapshot helper ──────────────────────────────────────────────
+
+def _snapshot_to_status(snapshot) -> str:
+    """
+    Map the current graph position to a user-facing status string.
+    When interrupt() is called inside a node, snapshot.next == [that_node_name].
+    """
+    if not snapshot or not snapshot.values:
+        return "not_found"
+    if not snapshot.next:
+        return "completed"
+    next_node = snapshot.next[0] if snapshot.next else ""
+    if next_node == "human_checkpoint":
+        return "awaiting_approval"         # interrupted inside human_checkpoint
+    if next_node == "human_checkpoint_code":
+        return "awaiting_code_review"      # interrupted inside human_checkpoint_code
+    return "running"
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -62,19 +103,11 @@ def run_discovery(
     cluster_id: str = "",
 ) -> dict:
     """
-    Start a discovery run with explicit workspace credentials.
-    Empty strings fall back to ~/.databrickscfg DEFAULT profile.
-
-    Returns:
-      {"status": "awaiting_approval", "opportunities": [...], "run_id": "..."}
-      {"status": "error", "error": "...", "run_id": "..."}
+    Start a full run (Phase 1 + Phase 2).
+    Returns after the first human_checkpoint (opportunity approval).
     """
-    ctx = WorkspaceContext(
-        host=host, token=token, catalog=catalog,
-        schema=schema, cluster_id=cluster_id,
-    )
+    ctx = WorkspaceContext(host=host, token=token, catalog=catalog, schema=schema, cluster_id=cluster_id)
 
-    # Pre-flight: validate catalog + schema exist before running the graph
     validation = validate_workspace(ctx)
     if not validation["valid"]:
         return {"status": "error", "error": validation["error"], "field": validation.get("field"), "run_id": run_id}
@@ -85,6 +118,9 @@ def run_discovery(
         "estate_summary": "",
         "opportunities": [],
         "approved_opportunity": None,
+        "feature_plan": None,
+        "generated_artifacts": [],
+        "bundle_written": False,
         "error": None,
     }
 
@@ -98,39 +134,87 @@ def run_discovery(
         return {"status": "error", "error": str(e), "run_id": run_id}
 
     snapshot = graph.get_state(config)
-    is_interrupted = bool(snapshot.next)
-
-    if is_interrupted:
-        return {
-            "status": "awaiting_approval",
-            "run_id": run_id,
-            "opportunities": snapshot.values.get("opportunities", []),
-        }
+    status = _snapshot_to_status(snapshot)
 
     return {
-        "status": "completed",
+        "status": status,
         "run_id": run_id,
-        "approved_opportunity": snapshot.values.get("approved_opportunity"),
-        "error": snapshot.values.get("error"),
+        "opportunities": snapshot.values.get("opportunities", []),
     }
 
 
 def approve_opportunity(run_id: str, selected_rank: int) -> dict:
-    """Resume a paused run with the user's approved opportunity."""
+    """
+    Resume from opportunity approval checkpoint.
+    Graph then runs: plan_features → generate_code → human_checkpoint_code (pauses again).
+    """
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
 
     try:
-        result = graph.invoke(Command(resume={"selected_rank": selected_rank}), config=config)
+        graph.invoke(Command(resume={"selected_rank": selected_rank}), config=config)
     except Exception as e:
-        logger.error("Graph resume failed: %s", e)
+        logger.error("Graph resume (approve_opportunity) failed: %s", e)
         return {"status": "error", "error": str(e), "run_id": run_id}
 
-    return {
-        "status": "completed",
+    snapshot = graph.get_state(config)
+    status = _snapshot_to_status(snapshot)
+    values = snapshot.values
+
+    result = {
+        "status": status,
         "run_id": run_id,
-        "approved_opportunity": result.get("approved_opportunity"),
-        "error": result.get("error"),
+        "approved_opportunity": values.get("approved_opportunity"),
+        "error": values.get("error"),
+    }
+
+    if status == "awaiting_code_review":
+        artifacts = values.get("generated_artifacts", [])
+        result["notebooks"] = [
+            {
+                "filename": a["filename"],
+                "filepath": a["filepath"],
+                "content": a["content"],
+            }
+            for a in artifacts if a["filename"].endswith(".py")
+        ]
+        result["job_yamls"] = [
+            {"filename": a["filename"], "filepath": a["filepath"]}
+            for a in artifacts if a["filename"].endswith(".yml")
+        ]
+
+    return result
+
+
+def approve_code(run_id: str, action: str = "approve", instructions: str = "") -> dict:
+    """
+    Resume from code review checkpoint.
+    action="approve" → write bundle to disk.
+    action="regenerate" → (Phase 4) provide instructions to regenerate.
+    """
+    graph = _get_graph()
+    config = {"configurable": {"thread_id": run_id}}
+
+    try:
+        result = graph.invoke(
+            Command(resume={"action": action, "instructions": instructions}),
+            config=config,
+        )
+    except Exception as e:
+        logger.error("Graph resume (approve_code) failed: %s", e)
+        return {"status": "error", "error": str(e), "run_id": run_id}
+
+    snapshot = graph.get_state(config)
+    values = snapshot.values
+
+    return {
+        "status": "completed" if values.get("bundle_written") else "error",
+        "run_id": run_id,
+        "bundle_written": values.get("bundle_written", False),
+        "error": values.get("error"),
+        "artifacts_written": [
+            a["filepath"] for a in values.get("generated_artifacts", [])
+        ],
     }
 
 
@@ -141,8 +225,5 @@ def get_run_state(run_id: str) -> dict:
     if not snapshot or not snapshot.values:
         return {"status": "not_found", "run_id": run_id}
 
-    return {
-        "run_id": run_id,
-        "status": "awaiting_approval" if bool(snapshot.next) else "completed",
-        "values": snapshot.values,
-    }
+    status = _snapshot_to_status(snapshot)
+    return {"run_id": run_id, "status": status, "values": snapshot.values}
