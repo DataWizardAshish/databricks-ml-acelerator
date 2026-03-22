@@ -107,27 +107,64 @@ Customer Databricks Workspace
 
 ## Agent Pipeline (LangGraph Graph)
 
+Current implemented flow (Phase 1 + Phase 2 + Trust Layer):
+
 ```
-[Unity Catalog Discovery]
+[Unity Catalog Discovery]       ← REST API only, zero compute
         ↓
-[Data Estate Analysis]
+[Data Estate Analysis]          ← LLM enrichment: inferred relationships, quality signals
         ↓
-[ML Opportunity Ranker]
-        ↓
+[ML Opportunity Ranker]         ← Top 3 use cases ranked by value × readiness
+        ↓                         Includes: financial_impact ($), confidence level
 ⏸ HUMAN CHECKPOINT — approve opportunity
         ↓
-[Feature Engineering Planner]
+[Dry Run / Explain]             ← LLM generates plain-English plan before any code runs
+        ↓                         Fields: tables_to_read/write, grant_statements, DBU cost,
+        ↓                         runtime, feature_columns, join_keys, row_count, target_detail
+[Business Brief Generator]      ← Deterministic (no LLM) — CTO-facing markdown brief
+        ↓                         Sections: Business Case, What Will Be Built, Execution Plan,
+        ↓                         Governance. Stored in exec_summary before code gen.
+⏸ HUMAN CHECKPOINT — confirm dry run plan
         ↓
-[Code Generator]
+[Feature Engineering Planner]  ← Schema-aware feature plan
         ↓
-⏸ HUMAN CHECKPOINT — review generated code
+[Code Generator]                ← 3 notebooks: feature pipeline, training, batch inference
+        ↓                         Rules: mandatory aliasing before every join, no self-joins,
+        ↓                         groupBy/agg over window functions, temporal train/test split
+[Risk Scorecard]                ← Rule-based checks: temporal split, leakage, GRANT, MLflow,
+        ↓                         dbutils.widgets, Champion alias, class imbalance
+⏸ HUMAN CHECKPOINT — review generated code + scorecard
         ↓
-[Deployment Executor]
+[Bundle Writer]                 ← Writes notebooks + job YAMLs to bundles/
         ↓
-[Monitoring Setup]
+[Executive Summary]             ← Full technical SUMMARY.md: risk scorecard + artifacts +
+        ↓                         business case. Overwrites exec_summary in state.
+[END]
+
+Future:
+[Deployment Executor]           ← Phase 3
         ↓
-[Drift Detection Loop] ← runs continuously
+[Monitoring Setup]              ← Phase 5
+        ↓
+[Drift Detection Loop] ←──────── runs continuously
 ```
+
+### Human Checkpoints and API Status Mapping
+
+| Interrupt node | API status | API endpoint to resume |
+|---|---|---|
+| `human_checkpoint` | `awaiting_approval` | `POST /runs/{id}/approve` |
+| `dry_run_checkpoint` | `awaiting_dry_run_confirmation` | `POST /runs/{id}/confirm-dry-run` |
+| `human_checkpoint_code` | `awaiting_code_review` | `POST /runs/{id}/approve-code` |
+
+### Key node files
+
+| File | Nodes |
+|---|---|
+| `agent/nodes.py` | `discover_catalog`, `analyze_estate`, `rank_opportunities`, `human_checkpoint` |
+| `agent/trust_nodes.py` | `dry_run_explain`, `generate_business_brief`, `dry_run_checkpoint`, `compute_risk_scorecard`, `generate_exec_summary` |
+| `agent/code_gen_nodes.py` | `plan_features`, `generate_code`, `human_checkpoint_code`, `write_bundle` |
+| `agent/chat.py` | `ask_about_run()` — scoped Q&A per run/step, called by `/runs/{id}/ask` |
 
 ---
 
@@ -148,14 +185,14 @@ This governance-aware code generation is the primary technical differentiator fr
 
 ---
 
-## Pre-Phase 2 Improvements (Implement Before Code Generation)
+## Pre-Phase 2 Improvements (All Completed)
 
-These are confirmed architectural gaps found during Phase 1 build and testing:
+Architectural gaps addressed before Phase 2:
 
-1. **Request-scoped workspace connection** — host, PAT, catalog, schema passed per API request (not global settings). Enables different teams on different workspaces with no config changes.
-2. **UC validation before agent runs** — call `catalogs.get()` + `schemas.get()` before starting the graph. Return clear "catalog not found" / "schema not found" errors, not stack traces.
-3. **Catalog + schema browse mode** — list available catalogs/schemas via SDK and render as dropdowns in UI. No free-text typos.
-4. **Databricks Asset Bundle (DAB) scaffold** — create `bundles/` structure now so Phase 2 generated code has a governed home. Jobs in `resources/jobs/`, notebooks in `src/{use_case}/`.
+1. ✅ **Request-scoped workspace connection** — `WorkspaceContext` pattern: host, PAT, catalog, schema passed per API request. Thread-safe, multi-workspace. Lives in `tools/workspace_context.py`.
+2. ✅ **UC validation before agent runs** — `validate_workspace(ctx)` calls `catalogs.get()` + `schemas.get()` at startup. Returns structured error with `field` key for clean UI display.
+3. ✅ **Catalog + schema browse mode** — `/browse/catalogs` + `/browse/schemas` endpoints. UI renders dropdowns, no free-text typos.
+4. ✅ **Databricks Asset Bundle (DAB) scaffold** — `bundles/` created with `databricks.yml`, `resources/jobs/`, `src/`. All generated code lands here.
 
 ---
 
@@ -203,11 +240,33 @@ These are the recurring, everyday blockers — not rare edge cases. The agent sh
 
 **Test:** Given a real Unity Catalog, does it return credible ML opportunity recommendations?
 
-### Phase 2 (Weeks 4–6): Code Generation
-- Feature engineering notebook generator
-- Training job generator (MLflow integrated)
-- Batch inference job generator
-- Generated code must actually run on Databricks
+### Phase 2 (Weeks 4–6): Code Generation + Trust Layer ✅ Complete
+
+**Code generation:**
+- Feature engineering notebook (PySpark, mandatory join aliasing, no self-joins, groupBy/agg only)
+- Training notebook (MLflow integrated, UC model registry, Champion alias, temporal split)
+- Batch inference notebook (dbutils.widgets, GRANT statements, lineage-safe)
+- 3 Databricks Job YAMLs via DAB scaffold → `bundles/`
+
+**Trust layer:**
+- **Business impact estimator** — financial_impact ($range) + confidence on every opportunity
+- **Dry run / explain mode** — LLM plan before any code runs: tables, grants, DBU cost, runtime, feature_columns, join_keys, row_count estimate
+- **Business Brief Generator** — deterministic (no LLM) CTO brief between dry run and code gen
+- **Risk scorecard** — rule-based checks: temporal split, leakage, GRANT completeness, MLflow tracking, dbutils.widgets usage, Champion alias, class imbalance
+- **Executive summary** — full technical SUMMARY.md after bundle write (risk scorecard + artifacts)
+
+**UI (6-step flow):**
+1. **Discover** — connect workspace, select catalog/schema, run discovery
+2. **Data Estate** — table/column inventory with type badges, column explorer, AI analysis
+3. **Approve Opportunity** — ranked use cases with financial impact + confidence
+4. **Confirm Dry Run** — two-tab view: CTO business brief + technical plan (features, joins, grants)
+5. **Code Review** — risk scorecard banner + notebook viewer + approve/regenerate
+6. **Bundle Written** — exec summary + generated files + deploy commands
+
+**UX guardrails:**
+- Schema change guard — warning modal when changing catalog/schema mid-run
+- Back buttons on all steps (each step resets only its downstream state)
+- Contextual Q&A panel on steps 3–6: scoped to current run state, client-side off-topic filter before any LLM call
 
 **Test:** Does the generated notebook execute without errors on a real cluster?
 

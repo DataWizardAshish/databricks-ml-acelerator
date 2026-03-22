@@ -7,6 +7,7 @@ Node flow:
   discover_catalog → analyze_estate → rank_opportunities → human_checkpoint
 """
 
+import dataclasses
 import json
 import logging
 
@@ -14,6 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
 from tools.uc_reader import UCReader
+from tools.workspace_context import WorkspaceContext
 from agent.state import AgentState, MLOpportunity
 
 logger = logging.getLogger(__name__)
@@ -23,14 +25,16 @@ logger = logging.getLogger(__name__)
 
 def discover_catalog(state: AgentState) -> AgentState:
     """Read all table metadata from UC. No raw data, no compute."""
-    ctx = state["workspace"]
+    ctx = WorkspaceContext(**state["workspace"])
     logger.info("Discovering %s.%s", ctx.catalog, ctx.schema)
     try:
         reader = UCReader(ctx)
         tables = reader.list_tables()
         estate_summary = reader.build_estate_summary(tables)
-        logger.info("Discovered %d tables", len(tables))
-        return {**state, "tables": tables, "estate_summary": estate_summary, "error": None}
+        # Convert TableInfo dataclasses to plain dicts for JSON-serializable state
+        tables_dicts = [dataclasses.asdict(t) for t in tables]
+        logger.info("Discovered %d tables", len(tables_dicts))
+        return {**state, "tables": tables_dicts, "estate_summary": estate_summary, "error": None}
     except Exception as e:
         logger.error("Discovery failed: %s", e)
         return {**state, "tables": [], "estate_summary": "", "error": str(e)}
@@ -44,7 +48,7 @@ def analyze_estate(state: AgentState) -> AgentState:
         return state
 
     logger.info("Analyzing data estate")
-    llm = state["workspace"].get_llm()
+    llm = WorkspaceContext(**state["workspace"]).get_llm()
 
     response = llm.invoke([
         SystemMessage(content=(
@@ -64,13 +68,17 @@ def analyze_estate(state: AgentState) -> AgentState:
 
 # ── Node 3: Rank ML Opportunities ────────────────────────────────────────────
 
-_RANK_SYSTEM = """You are a senior ML engineer at a Databricks consultancy.
+_RANK_SYSTEM = """You are a senior ML engineer and product strategist at a Databricks consultancy.
 Identify the top 3 most valuable, most achievable ML use cases from the customer's Unity Catalog data estate.
 
 Rules:
 - Only recommend use cases directly supported by the observed tables/columns
 - Estimate AUC/RMSE ranges conservatively based on data signals
 - Rank by: business value × data readiness × inverse complexity
+- For financial_impact: translate the ML outcome into a business dollar range using realistic industry benchmarks.
+  Examples: churn reduction → retained ARR, demand forecasting → inventory cost reduction,
+  fraud detection → prevented losses, propensity → conversion uplift on revenue
+- Be conservative. Use ranges. Never invent data not present in the estate.
 - Output MUST be valid JSON only — no prose, no markdown fences"""
 
 _RANK_PROMPT = """Given this data estate, identify the top 3 ML opportunities.
@@ -87,7 +95,9 @@ Return a JSON array of exactly 3 objects:
     "feature_tables": ["catalog.schema.table1"],
     "ml_type": "classification|regression|clustering|forecasting",
     "estimated_auc_range": "e.g. 75-83%",
-    "business_value": "1-2 sentence impact statement",
+    "business_value": "1-2 sentence operational impact statement",
+    "financial_impact": "Estimated $X-Y [saved/retained/recovered] annually based on [specific mechanism]. Confidence: medium.",
+    "confidence": "high|medium|low",
     "complexity": "low|medium|high",
     "rationale": "why this data supports this use case"
   }}
@@ -100,7 +110,7 @@ def rank_opportunities(state: AgentState) -> AgentState:
         return state
 
     logger.info("Ranking ML opportunities")
-    llm = state["workspace"].get_llm()
+    llm = WorkspaceContext(**state["workspace"]).get_llm()
 
     response = llm.invoke([
         SystemMessage(content=_RANK_SYSTEM),

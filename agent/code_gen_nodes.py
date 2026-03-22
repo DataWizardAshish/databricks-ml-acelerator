@@ -15,6 +15,7 @@ from langgraph.types import interrupt
 
 from agent.state import AgentState, FeaturePlan
 from tools.bundle_writer import slugify, prepare_artifacts_from_generation, write_artifacts
+from tools.workspace_context import WorkspaceContext
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ def plan_features(state: AgentState) -> AgentState:
         return state
 
     logger.info("Planning features for: %s", opp.get("use_case"))
-    llm = state["workspace"].get_llm()
+    llm = WorkspaceContext(**state["workspace"]).get_llm()
     slug = slugify(opp.get("use_case", "ml_use_case"))
 
     prompt = _PLAN_PROMPT.format(
@@ -97,23 +98,55 @@ def plan_features(state: AgentState) -> AgentState:
 _NB_SYSTEM = """You are an expert Databricks engineer. Generate production-ready Databricks Python notebooks.
 
 STRICT RULES — violating any of these will break the notebook:
-1. Start every notebook with exactly: # Databricks notebook source
-2. Separate every cell with exactly: # COMMAND ----------
-3. Use spark (already available) and dbutils (already available) — never import them
-4. ALL table names come from dbutils.widgets — never hardcode catalog/schema/table names
-5. Use spark.table(f"{{catalog}}.{{schema}}.{{table}}") to read UC tables
-6. Use df.write.format("delta").mode("overwrite").saveAsTable(f"{{catalog}}.{{schema}}.{{table}}") to write
-7. For MLflow UC registry: mlflow.set_registry_uri("databricks-uc") BEFORE any mlflow calls
-8. Register model as: mlflow.register_model(f"runs:/{{run_id}}/model", f"{{catalog}}.{{schema}}.{{model_name}}")
-9. Set Champion alias using MlflowClient().set_registered_model_alias(...)
+1.  Start every notebook with exactly: # Databricks notebook source
+2.  Separate every cell with exactly: # COMMAND ----------
+3.  Use spark (already available) and dbutils (already available) — never import them
+4.  ALL table names come from dbutils.widgets — never hardcode catalog/schema/table names
+5.  Use spark.table(f"{{catalog}}.{{schema}}.{{table}}") to read UC tables
+6.  Use df.write.format("delta").mode("overwrite").saveAsTable(f"{{catalog}}.{{schema}}.{{table}}") to write
+7.  For MLflow UC registry: mlflow.set_registry_uri("databricks-uc") BEFORE any mlflow calls
+8.  Register model as: mlflow.register_model(f"runs:/{{run_id}}/model", f"{{catalog}}.{{schema}}.{{model_name}}")
+9.  Set Champion alias using MlflowClient().set_registered_model_alias(...)
 10. Load model in inference as: mlflow.pyfunc.load_model(f"models:/{{catalog}}.{{schema}}.{{model_name}}@Champion")
 11. GRANT statement must use spark.sql(), NOT %sql magic
 12. Every widget must have a default value in dbutils.widgets.text("name", "default")
 13. Never use pandas on large Spark DataFrames — convert with .toPandas() only after filtering to model input size
-14. Output ONLY the notebook code — no explanation, no markdown"""
+14. Output ONLY the notebook code — no explanation, no markdown
+
+CRITICAL JOIN RULES — ambiguous column references will cause ExtendedAnalysisException at runtime:
+15. ALWAYS alias EVERY DataFrame before joining:
+    df_orders = orders_raw.alias("orders")
+    df_customers = customers_raw.alias("customers")
+    joined = df_orders.join(df_customers, df_orders["customer_id"] == df_customers["customer_id"], "left")
+16. NEVER join a DataFrame variable to itself or to another DataFrame derived from the same source
+    without giving BOTH sides different alias names first
+17. After every join, immediately select only the columns you need with explicit table prefixes:
+    result = joined.select(df_orders["order_id"], df_orders["amount"], df_customers["segment"])
+18. When aggregating from multiple tables: build each aggregation as a SEPARATE named variable,
+    then join the aggregations sequentially. Never chain joins on the same base variable.
+    CORRECT:
+        agg1 = df_orders.groupBy("customer_id").agg(count("*").alias("order_count"))
+        agg2 = df_products.groupBy("customer_id").agg(sum("amount").alias("total_spend"))
+        features = base_df.join(agg1, "customer_id", "left").join(agg2, "customer_id", "left")
+    WRONG:
+        df = df.join(df.groupBy(...).agg(...), ...)   # self-join — will fail
+
+FEATURE ENGINEERING SIMPLICITY RULES:
+19. Use groupBy().agg() for ALL aggregations — DO NOT use window functions (over(), partitionBy())
+    unless there is absolutely no simpler alternative. Window functions cause ambiguous reference errors.
+20. Keep transforms flat and explicit:
+    - Numeric: cast to DoubleType, fillna(0), simple arithmetic (+, -, *, /)
+    - Dates: datediff(current_date(), col("date_col")).alias("days_since_X")
+    - Categorical: StringIndexer or simple when().otherwise() — NOT complex UDFs
+    - Binary flags: when(col("x") > 0, 1).otherwise(0).alias("flag_x")
+21. Do NOT generate more than 5 joins in a single notebook. If more joins are needed,
+    materialize intermediate results as temporary views first:
+    intermediate.createOrReplaceTempView("intermediate_features")
+    final_df = spark.table("intermediate_features").join(...)"""
 
 
 def _feature_engineering_prompt(opp: dict, plan: FeaturePlan, catalog: str, output_schema: str) -> str:
+    discovery_schema = opp.get("target_table", "").split(".")[1] if opp.get("target_table", "").count(".") >= 1 else "schema"
     return f"""Generate a complete Databricks feature engineering notebook.
 
 APPROVED OPPORTUNITY:
@@ -123,7 +156,7 @@ FEATURE PLAN:
 {json.dumps(plan, indent=2)}
 
 NOTEBOOK REQUIREMENTS:
-- Widgets: catalog (default "{catalog}"), discovery_schema (default "{opp.get('target_table', '').split('.')[1] if '.' in opp.get('target_table','') else 'schema'}"), output_schema (default "{output_schema}"), run_date (default today)
+- Widgets: catalog (default "{catalog}"), discovery_schema (default "{discovery_schema}"), output_schema (default "{output_schema}"), run_date (default today)
 - Read source tables using spark.table() with full catalog.schema.table path from widgets
 - Apply EVERY transform in feature_decisions exactly as specified
 - Drop all high_cardinality_cols: {plan.get('high_cardinality_cols', [])} OR hash_encode them per plan
@@ -132,7 +165,18 @@ NOTEBOOK REQUIREMENTS:
 - Add a run_date partition column
 - Write feature table to: {{catalog}}.{output_schema}.{plan.get('feature_table_name')}
 - After writing, emit: spark.sql(f"GRANT SELECT ON TABLE {{catalog}}.{output_schema}.{plan.get('feature_table_name')} TO `account users`")
-- Print row count before and after each major step"""
+- Print row count before and after each major step
+
+MANDATORY JOIN PATTERN — follow this exact structure for all joins:
+  Step 1: Read each source table into a SEPARATE named variable (e.g. df_orders, df_customers)
+  Step 2: Build aggregations with groupBy().agg() into SEPARATE named variables (agg_orders, agg_customers)
+  Step 3: Start with the primary/target table as the base: base = df_target.alias("base")
+  Step 4: Join each aggregation ONE at a time, aliasing both sides:
+    agg_orders_a = agg_orders.alias("agg_orders")
+    features = base.join(agg_orders_a, base["id"] == agg_orders_a["id"], "left")
+    features = features.select("base.*", agg_orders_a["order_count"], ...)
+  Step 5: After all joins, apply column transforms to the final features DataFrame
+  NEVER join the same source DataFrame twice without re-aliasing it with a new name."""
 
 
 def _training_prompt(opp: dict, plan: FeaturePlan, catalog: str, output_schema: str) -> str:
@@ -199,7 +243,7 @@ def generate_code(state: AgentState) -> AgentState:
     if not opp or not plan or state.get("error"):
         return state
 
-    ctx = state["workspace"]
+    ctx = WorkspaceContext(**state["workspace"])
     llm = ctx.get_llm(max_tokens=8192)
     output_schema = "ml_accelerator"
     slug = slugify(opp.get("use_case", "ml_use_case"))

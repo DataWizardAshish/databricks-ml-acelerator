@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 .pytest_cache/
+
+# SQLite checkpoints (durable LangGraph state)
+data/*.db
+data/*.db-shm
+data/*.db-wal
