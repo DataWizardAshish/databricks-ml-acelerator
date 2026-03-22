@@ -55,25 +55,35 @@ Your Databricks Workspace
 ### Agent Pipeline
 
 ```
-[Unity Catalog Discovery]   ← REST API only, zero compute
+[Unity Catalog Discovery]       ← REST API only, zero compute
         ↓
-[Data Estate Analysis]      ← LLM analysis of table/column metadata
+[Data Estate Analysis]          ← LLM enrichment: relationships, quality signals
         ↓
-[ML Opportunity Ranker]     ← Top 3 use cases ranked by value × readiness
+[ML Opportunity Ranker]         ← Top 3 use cases + financial impact ($) + confidence level
         ↓
 ⏸ HUMAN CHECKPOINT — approve opportunity
         ↓
-[Feature Engineering Planner]   ← Phase 2
+[Dry Run / Explain]             ← LLM plan: tables read/written, grants, DBU cost,
+        ↓                         feature_columns, join_keys, row_count estimate
+[Business Brief Generator]      ← Deterministic CTO brief (no LLM) stored pre-code-gen
         ↓
-[Code Generator]                ← Phase 2
+⏸ HUMAN CHECKPOINT — confirm dry run plan
         ↓
-⏸ HUMAN CHECKPOINT — review generated code
+[Feature Engineering Planner]
         ↓
-[Deployment Executor]           ← Phase 2
+[Code Generator]                ← 3 notebooks: feature pipeline, training, batch inference
         ↓
-[Monitoring Setup]              ← Phase 5
+[Risk Scorecard]                ← Automated checks: leakage, temporal split, governance, MLflow,
+        ↓                         dbutils.widgets, Champion alias, class imbalance
+⏸ HUMAN CHECKPOINT — review code + risk scorecard
         ↓
-[Drift Detection Loop] ←────────── runs continuously
+[Bundle Writer]                 ← Writes to bundles/ (notebooks + job YAMLs)
+        ↓
+[Executive Summary]             ← Full technical SUMMARY.md: scorecard + artifacts + ROI
+        ↓
+[END — ready to deploy]
+
+Future: Deployment Executor (Phase 3) → Monitoring + Drift Detection (Phase 5)
 ```
 
 ---
@@ -83,32 +93,40 @@ Your Databricks Workspace
 ```
 databricks-ml-accelerator/
 │
-├── agent/                   # LangGraph orchestration
-│   ├── graph.py             # Graph definition + public run_discovery() API
-│   ├── nodes.py             # 4 nodes: discover → analyze → rank → checkpoint
-│   └── state.py             # AgentState TypedDict
+├── agent/                      # LangGraph orchestration
+│   ├── graph.py                # Graph definition + public API (run_discovery, approve_opportunity, …)
+│   ├── nodes.py                # Phase 1: discover_catalog → analyze_estate → rank_opportunities
+│   ├── trust_nodes.py          # Trust layer: dry_run_explain, generate_business_brief,
+│   │                           #   dry_run_checkpoint, compute_risk_scorecard, generate_exec_summary
+│   ├── code_gen_nodes.py       # Phase 2: plan_features → generate_code → human_checkpoint_code → write_bundle
+│   ├── chat.py                 # Contextual Q&A: step-scoped run context → LLM answer
+│   └── state.py                # AgentState + DryRunPlan TypedDicts
 │
-├── tools/                   # Reusable tools called by agent nodes
-│   ├── uc_reader.py         # Unity Catalog metadata reader (no Spark)
-│   └── workspace_context.py # Per-request auth context + UC validation
+├── tools/                      # Reusable tools called by agent nodes
+│   ├── uc_reader.py            # Unity Catalog metadata reader (no Spark, REST only)
+│   ├── bundle_writer.py        # Writes generated notebooks + job YAMLs to bundles/
+│   └── workspace_context.py   # Per-request auth context, UC validation, browse helpers
 │
-├── api/                     # FastAPI backend
-│   └── main.py              # /health, /browse/*, /runs/* endpoints
+├── api/                        # FastAPI backend
+│   └── main.py                 # /health, /browse/*, /runs/*, /runs/{id}/ask endpoints
 │
-├── ui/                      # Streamlit frontend
-│   └── app.py               # Connect → browse → discover → approve flow
+├── ui/                         # Streamlit frontend
+│   └── app.py                  # 6-step flow: Discover → Data Estate → Approve Opportunity
+│                               #   → Confirm Dry Run → Code Review → Bundle Written
+│                               #   Q&A panel on steps 3–6, client-side off-topic guardrail
 │
 ├── config/
-│   └── settings.py          # Pydantic settings (PAT now, OAuth-ready)
+│   └── settings.py             # Pydantic settings (PAT now, OAuth-ready)
 │
-├── bundles/                 # Databricks Asset Bundle (Phase 2 output lands here)
-│   ├── databricks.yml       # Bundle config: dev + prod targets
-│   ├── resources/jobs/      # Generated job YAML definitions
-│   └── src/                 # Generated notebooks per use case
+├── bundles/                    # Databricks Asset Bundle (generated code lands here)
+│   ├── databricks.yml          # Bundle config: dev + prod targets
+│   ├── SUMMARY.md              # Auto-generated CTO-facing executive summary
+│   ├── resources/jobs/         # Generated job YAML definitions (3 per use case)
+│   └── src/{use_case}/         # Generated notebooks (feature, training, inference)
 │
-├── .env.example             # Config template (copy to .env, never commit .env)
+├── .env.example                # Config template (copy to .env, never commit .env)
 ├── requirements.txt
-└── CLAUDE.md                # Project context, decisions, and build phases
+└── CLAUDE.md                   # Project context, decisions, and build phases
 ```
 
 ---
@@ -185,12 +203,42 @@ python run_ui.py
 ## Usage
 
 1. Open `http://localhost:8501`
-2. Click **Connect & Browse Catalogs** in the sidebar (or leave blank to use `~/.databrickscfg`)
+2. Click **Connect & Browse** in the sidebar (or leave blank to use `~/.databrickscfg`)
 3. Select your **Catalog** and **Schema** from the dropdowns
-4. Click **Discover ML Opportunities**
-5. Review the top 3 ranked ML use cases
-6. Click **Approve** on the one you want to build
-7. Phase 2 will generate the notebooks and jobs automatically
+4. Click **🔍 Discover** — agent reads UC metadata, analyzes the estate, ranks top 3 ML use cases
+
+**Step 2 — Data Estate Overview:**
+
+5. Review the discovered tables — type (MANAGED / EXTERNAL), column count, descriptions
+6. Expand any table to see its columns with types and nullability
+7. Read the AI analysis of entity relationships and data quality signals
+8. Click **→ See ML Recommendations** to advance
+
+**Step 3 — Approve Opportunity:**
+
+9. Each opportunity shows **financial impact estimate** and **confidence level**
+10. Ask questions using the **💬 Ask about this step** panel — scoped to this run
+11. Click **✅ Approve** on the use case you want to build
+
+**Step 4 — Confirm Dry Run:**
+
+12. Review the **Business Brief** tab (CTO view) — business case, execution plan, governance summary
+13. Review the **Technical Plan** tab — feature columns, join keys, tables to read/write, GRANT statements
+14. Ask questions in the Q&A panel, then click **✅ Confirm & Generate Code**
+
+**Step 5 — Code Review:**
+
+15. Review the **Risk Scorecard** — pass/warn/fail checks for leakage, temporal split, governance, MLflow
+16. Review the 3 generated notebooks — feature pipeline, training, batch inference
+17. Ask questions in the Q&A panel, then click **✅ Approve & Write Bundle** (blocked if any check is `fail`)
+
+**Step 6 — Bundle Written:**
+
+18. Review the **Executive Summary** tab and the **Generated Files** tab
+19. Use the **Deploy** tab to run `databricks bundle deploy`
+20. Ask post-deployment questions (monitoring, drift, etc.) in the Q&A panel
+
+> **Schema change guard:** Changing catalog/schema mid-run shows a confirmation dialog to prevent accidental loss of run progress. Use the **Back** button on any step to return without losing upstream state.
 
 ---
 
@@ -228,15 +276,34 @@ databricks bundle deploy --target prod --var workspace_host=https://prod-workspa
 
 ---
 
+## API Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Health check + version |
+| `GET` | `/browse/catalogs` | List UC catalogs in workspace |
+| `GET` | `/browse/schemas` | List schemas in a catalog |
+| `POST` | `/runs` | Start discovery run → returns `tables`, `estate_summary`, `opportunities` |
+| `GET` | `/runs/{id}` | Get run status + full state values |
+| `POST` | `/runs/{id}/approve` | Approve ML opportunity → returns dry run plan + CTO business brief |
+| `POST` | `/runs/{id}/confirm-dry-run` | Confirm plan → triggers code generation → returns notebooks + risk scorecard |
+| `POST` | `/runs/{id}/approve-code` | Approve code → writes bundle → returns exec summary + artifact paths |
+| `POST` | `/runs/{id}/ask` | Answer a question scoped to the current run state and step |
+
+Swagger UI available at `http://localhost:8000/docs`
+
+---
+
 ## Build Phases
 
 | Phase | Status | Description |
 |---|---|---|
-| **Phase 1** | ✅ Complete | UC Discovery + ML Opportunity Recommendation |
+| **Phase 1** | ✅ Complete | UC Discovery + ML Opportunity Recommendation (financial impact, confidence) |
 | **Step A** | ✅ Complete | Multi-workspace auth, UC validation, browse mode, DAB scaffold |
-| **Phase 2** | 🚧 In Progress | Feature pipeline + training job + inference job code generation |
+| **Phase 2** | ✅ Complete | Code generation + Trust Layer: dry run, business brief, risk scorecard, exec summary |
+| **Phase 2 UX** | ✅ Complete | 6-step UI flow, Data Estate view, Q&A panel, schema change guard, back buttons |
 | **Phase 3** | ⏳ Planned | Databricks Apps packaging + deployment |
-| **Phase 4** | ⏳ Planned | Human-in-the-loop code review + editing |
+| **Phase 4** | ⏳ Planned | Advanced human-in-loop (edit generated code inline, re-generate specific notebook) |
 | **Phase 5** | ⏳ Planned | Drift detection + auto-retraining loop |
 
 ---
