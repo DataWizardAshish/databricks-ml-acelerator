@@ -31,6 +31,7 @@ from agent.trust_nodes import (
     compute_risk_scorecard, generate_exec_summary,
 )
 from tools.workspace_context import WorkspaceContext, validate_workspace
+from audit.writer import get_audit_writer
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +241,8 @@ def run_discovery(
 
     initial_state: AgentState = {
         # Store workspace as plain dict so state is JSON-serializable for SQLite checkpointer
-        "workspace": ctx.model_dump(),
+        # run_id included so nodes can access it for audit trail emission
+        "workspace": {**ctx.model_dump(), "run_id": run_id},
         "tables": [], "estate_summary": "",
         "opportunities": [], "approved_opportunity": None,
         "dry_run_plan": None, "risk_scorecard": None, "exec_summary": "",
@@ -281,6 +283,23 @@ def approve_opportunity(run_id: str, selected_rank: int) -> dict:
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
 
+    # Emit audit event BEFORE resuming — captured even if downstream graph fails
+    snapshot = graph.get_state(config)
+    approved_opp = None
+    if snapshot and snapshot.values:
+        opps = snapshot.values.get("opportunities", [])
+        approved_opp = next((o for o in opps if o["rank"] == selected_rank), opps[0] if opps else None)
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type="opportunity_approved",
+            actor="user",
+            node_name="human_checkpoint",
+            payload={"selected_rank": selected_rank, "approved_opportunity": approved_opp},
+        )
+    except Exception:
+        pass
+
     try:
         graph.invoke(Command(resume={"selected_rank": selected_rank}), config=config)
     except Exception as e:
@@ -307,6 +326,17 @@ def confirm_dry_run(run_id: str) -> dict:
     """
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
+
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type="dry_run_confirmed",
+            actor="user",
+            node_name="dry_run_checkpoint",
+            payload={"confirmed": True},
+        )
+    except Exception:
+        pass
 
     try:
         graph.invoke(Command(resume={"confirmed": True}), config=config)
@@ -343,6 +373,21 @@ def approve_code(run_id: str, action: str = "approve", instructions: str = "") -
     """Resume from code review. Writes bundle + generates exec summary."""
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
+
+    event_type = "code_approved" if action == "approve" else "code_regeneration_requested"
+    payload: dict = {"action": action}
+    if instructions:
+        payload["instructions"] = instructions
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type=event_type,
+            actor="user",
+            node_name="human_checkpoint_code",
+            payload=payload,
+        )
+    except Exception:
+        pass
 
     try:
         graph.invoke(Command(resume={"action": action, "instructions": instructions}), config=config)

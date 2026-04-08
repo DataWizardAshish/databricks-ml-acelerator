@@ -8,6 +8,7 @@ Nodes:
   write_bundle           → writes artifacts to bundles/ directory
 """
 
+import hashlib
 import json
 import logging
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,6 +17,7 @@ from langgraph.types import interrupt
 from agent.state import AgentState, FeaturePlan
 from tools.bundle_writer import slugify, prepare_artifacts_from_generation, write_artifacts
 from tools.workspace_context import WorkspaceContext
+from audit.writer import get_audit_writer
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +287,28 @@ def generate_code(state: AgentState) -> AgentState:
     )
 
     logger.info("Generated %d artifacts", len(artifacts))
-    return {**state, "generated_artifacts": artifacts}
+    new_state = {**state, "generated_artifacts": artifacts}
+
+    try:
+        get_audit_writer().emit(
+            run_id=state["workspace"].get("run_id", ""),
+            event_type="code_generated",
+            actor="agent",
+            node_name="generate_code",
+            payload={
+                "artifacts": [
+                    {
+                        "filename": a["filename"],
+                        "content_hash": hashlib.sha256(a["content"].encode()).hexdigest(),
+                    }
+                    for a in artifacts
+                ]
+            },
+        )
+    except Exception:
+        pass
+
+    return new_state
 
 
 # ── Node 3: Human Checkpoint — Code Review ───────────────────────────────────
@@ -334,6 +357,18 @@ def write_bundle(state: AgentState) -> AgentState:
         logger.info("Bundle written: %d files", len(written))
         for path in written:
             logger.info("  %s", path)
+
+        try:
+            get_audit_writer().emit(
+                run_id=state["workspace"].get("run_id", ""),
+                event_type="bundle_written",
+                actor="agent",
+                node_name="write_bundle",
+                payload={"written_paths": written, "bundle_written": True},
+            )
+        except Exception:
+            pass
+
         return {**state, "bundle_written": True}
     except Exception as e:
         logger.error("Bundle write failed: %s", e)

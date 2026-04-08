@@ -28,6 +28,8 @@ from agent.graph import (
 )
 from tools.workspace_context import WorkspaceContext, list_catalogs, list_schemas
 from config.settings import get_settings
+from audit.store import get_audit_store
+from audit.verifier import ChainVerifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -68,6 +70,13 @@ class ApproveCodeRequest(BaseModel):
 class AskRequest(BaseModel):
     question: str
     step: str = "general"            # approve_opportunity | dry_run | code_review | done
+
+
+class AuditTrailResponse(BaseModel):
+    run_id: str
+    event_count: int
+    chain_valid: bool
+    events: list[dict]
 
 
 # ── Health ───────────────────────────────────────────────────────────────────
@@ -201,6 +210,22 @@ def approve_run_code(run_id: str, body: ApproveCodeRequest = ApproveCodeRequest(
     result = approve_code(run_id=run_id, action=body.action, instructions=body.instructions)
     record_run_history(run_id, status=result.get("status", ""))
     return result
+
+
+@app.get("/runs/{run_id}/audit", response_model=AuditTrailResponse)
+def get_audit_trail(run_id: str):
+    """Return the complete ordered audit trail for a run, with hash chain integrity check."""
+    store = get_audit_store()
+    events = store.get_events(run_id)
+    if not events:
+        raise HTTPException(status_code=404, detail=f"No audit trail found for run {run_id}")
+    result = ChainVerifier(store).verify(run_id)
+    return AuditTrailResponse(
+        run_id=run_id,
+        event_count=len(events),
+        chain_valid=result["valid"],
+        events=events,
+    )
 
 
 @app.post("/runs/{run_id}/ask")
