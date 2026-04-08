@@ -124,6 +124,9 @@ databricks-ml-accelerator/
 │   ├── resources/jobs/         # Generated job YAML definitions (3 per use case)
 │   └── src/{use_case}/         # Generated notebooks (feature, training, inference)
 │
+├── data/                       # Local persistent state (gitignored *.db files)
+│   └── checkpoints.db          # SQLite: LangGraph checkpoints + run_history table
+│
 ├── .env.example                # Config template (copy to .env, never commit .env)
 ├── requirements.txt
 └── CLAUDE.md                   # Project context, decisions, and build phases
@@ -162,6 +165,7 @@ pip install -r requirements.txt
 ```
 
 > **Note:** `databricks-connect` is intentionally excluded from the base install — Phase 1 uses only REST APIs (zero compute). Add it when Spark is needed in Phase 2.
+> **Note:** `langgraph-checkpoint-sqlite` is required for durable session memory. It is included in `requirements.txt` and installs automatically with `pip install -r requirements.txt`.
 
 ### 3. Configure authentication
 
@@ -206,6 +210,8 @@ python run_ui.py
 2. Click **Connect & Browse** in the sidebar (or leave blank to use `~/.databrickscfg`)
 3. Select your **Catalog** and **Schema** from the dropdowns
 4. Click **🔍 Discover** — agent reads UC metadata, analyzes the estate, ranks top 3 ML use cases
+
+> **Session persistence:** The `run_id` is stored in the browser URL. Hard-refreshing the page restores your exact position in the flow. If you have prior runs, a **Recent Runs** panel appears below the Discover button — click **Resume** to jump directly back into any run at its last checkpoint.
 
 **Step 2 — Data Estate Overview:**
 
@@ -283,8 +289,10 @@ databricks bundle deploy --target prod --var workspace_host=https://prod-workspa
 | `GET` | `/health` | Health check + version |
 | `GET` | `/browse/catalogs` | List UC catalogs in workspace |
 | `GET` | `/browse/schemas` | List schemas in a catalog |
+| `GET` | `/runs/history` | Recent runs list ordered by last update (episodic memory) |
 | `POST` | `/runs` | Start discovery run → returns `tables`, `estate_summary`, `opportunities` |
 | `GET` | `/runs/{id}` | Get run status + full state values |
+| `GET` | `/runs/{id}/rehydrate` | Restore full UI state from checkpoint (page refresh / Resume) |
 | `POST` | `/runs/{id}/approve` | Approve ML opportunity → returns dry run plan + CTO business brief |
 | `POST` | `/runs/{id}/confirm-dry-run` | Confirm plan → triggers code generation → returns notebooks + risk scorecard |
 | `POST` | `/runs/{id}/approve-code` | Approve code → writes bundle → returns exec summary + artifact paths |
@@ -302,6 +310,8 @@ Swagger UI available at `http://localhost:8000/docs`
 | **Step A** | ✅ Complete | Multi-workspace auth, UC validation, browse mode, DAB scaffold |
 | **Phase 2** | ✅ Complete | Code generation + Trust Layer: dry run, business brief, risk scorecard, exec summary |
 | **Phase 2 UX** | ✅ Complete | 6-step UI flow, Data Estate view, Q&A panel, schema change guard, back buttons |
+| **Session Memory** | ✅ Complete | Durable SQLite checkpointer — runs survive API restarts + page refresh; checkpoint-aware Discover (instant re-run) |
+| **Episodic Memory** | ✅ Complete | `run_history` table — Recent Runs panel on step 1, Resume from any prior run at its last checkpoint |
 | **Phase 3** | ⏳ Planned | Databricks Apps packaging + deployment |
 | **Phase 4** | ⏳ Planned | Advanced human-in-loop (edit generated code inline, re-generate specific notebook) |
 | **Phase 5** | ⏳ Planned | Drift detection + auto-retraining loop |
@@ -315,6 +325,8 @@ Swagger UI available at `http://localhost:8000/docs`
 - **Serverless SQL for profiling** — data quality checks in Phase 2 use serverless SQL warehouses (fast startup, no idle cost)
 - **Request-scoped auth** — `WorkspaceClient` created per API request, never shared globally — thread-safe, multi-workspace
 - **DAB from day one** — generated code is always a deployable bundle, not loose notebooks
+- **Durable session memory** — LangGraph checkpoints persisted to SQLite (`data/checkpoints.db`); `AgentState` uses plain dicts for JSON-safe serialization. Swappable for Delta-backed checkpointer in Phase 3
+- **Episodic memory** — `run_history` table in the same SQLite DB tracks all runs with status, catalog, schema, use case; powers the Recent Runs panel and Resume flow
 
 ---
 
@@ -331,7 +343,7 @@ Swagger UI available at `http://localhost:8000/docs`
 | Deployment | Databricks Apps |
 | CI/CD | Databricks Asset Bundles |
 | ML Tracking | MLflow |
-| State Persistence | Delta tables in Unity Catalog |
+| State Persistence | SQLite (local dev) → Delta tables in Unity Catalog (Phase 3) |
 
 ---
 

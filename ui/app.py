@@ -450,6 +450,40 @@ if current == 0:
             except Exception as e:
                 st.error(f"Error: {e}")
 
+    # ── Recent Runs (episodic memory) ─────────────────────────────────────────
+    _STATUS_BADGE = {
+        "awaiting_approval":            "🟡 Awaiting Approval",
+        "awaiting_dry_run_confirmation": "🟡 Dry Run",
+        "awaiting_code_review":         "🟡 Code Review",
+        "completed":                    "🟢 Complete",
+        "error":                        "🔴 Error",
+        "running":                      "🔵 Running",
+    }
+    try:
+        history_data = api_get("/runs/history")
+        recent_runs = history_data.get("runs", [])
+    except Exception:
+        recent_runs = []
+
+    if recent_runs:
+        st.divider()
+        st.subheader("Recent Runs")
+        for run in recent_runs:
+            with st.container(border=True):
+                c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 1])
+                c1.caption(f"`{run['run_id'][:8]}…`")
+                c2.caption(f"`{run['catalog']}.{run['schema']}`")
+                c3.caption(run["use_case"] or "—")
+                c4.caption(_STATUS_BADGE.get(run["status"], run["status"]))
+                with c5:
+                    if st.button("Resume", key=f"resume_{run['run_id']}"):
+                        with st.spinner("Restoring run…"):
+                            if _try_rehydrate(run["run_id"]):
+                                st.query_params["run_id"] = run["run_id"]
+                                st.rerun()
+                            else:
+                                st.error("Could not restore this run.")
+
 
 # ── Step 2: Data Estate Overview ─────────────────────────────────────────────
 elif current == 1:

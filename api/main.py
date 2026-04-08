@@ -5,6 +5,7 @@ Endpoints:
   GET  /health
   GET  /browse/catalogs
   GET  /browse/schemas
+  GET  /runs/history                      — recent runs list (episodic memory)
   POST /runs                              — start discovery run
   GET  /runs/{run_id}                     — get run status
   GET  /runs/{run_id}/rehydrate           — restore full UI state from checkpoint (page refresh)
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 from agent.graph import (
     run_discovery, approve_opportunity, confirm_dry_run,
     approve_code, get_run_state, get_run_rehydrate,
+    record_run_history, get_run_history,
 )
 from tools.workspace_context import WorkspaceContext, list_catalogs, list_schemas
 from config.settings import get_settings
@@ -109,6 +111,12 @@ def browse_schemas(
 
 # ── Runs ─────────────────────────────────────────────────────────────────────
 
+@app.get("/runs/history")
+def list_run_history(limit: int = Query(default=20, ge=1, le=100)):
+    """Return recent runs ordered by last update, newest first (episodic memory)."""
+    return {"runs": get_run_history(limit=limit)}
+
+
 @app.post("/runs", status_code=202)
 def start_run(body: StartRunRequest = StartRunRequest()):
     """Start a new discovery + recommendation run (Phase 1)."""
@@ -156,7 +164,11 @@ def approve_run(run_id: str, body: ApproveOpportunityRequest = ApproveOpportunit
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_approval'",
         )
-    return approve_opportunity(run_id=run_id, selected_rank=body.selected_rank)
+    result = approve_opportunity(run_id=run_id, selected_rank=body.selected_rank)
+    if result.get("approved_opportunity"):
+        use_case = result["approved_opportunity"].get("use_case", "")
+        record_run_history(run_id, use_case=use_case, status=result.get("status", ""))
+    return result
 
 
 @app.post("/runs/{run_id}/confirm-dry-run")
@@ -170,7 +182,9 @@ def confirm_dry_run_endpoint(run_id: str):
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_dry_run_confirmation'",
         )
-    return confirm_dry_run(run_id=run_id)
+    result = confirm_dry_run(run_id=run_id)
+    record_run_history(run_id, status=result.get("status", ""))
+    return result
 
 
 @app.post("/runs/{run_id}/approve-code")
@@ -184,7 +198,9 @@ def approve_run_code(run_id: str, body: ApproveCodeRequest = ApproveCodeRequest(
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_code_review'",
         )
-    return approve_code(run_id=run_id, action=body.action, instructions=body.instructions)
+    result = approve_code(run_id=run_id, action=body.action, instructions=body.instructions)
+    record_run_history(run_id, status=result.get("status", ""))
+    return result
 
 
 @app.post("/runs/{run_id}/ask")

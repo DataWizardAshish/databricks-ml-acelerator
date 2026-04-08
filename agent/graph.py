@@ -17,6 +17,7 @@ Full graph:
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
@@ -35,6 +36,18 @@ logger = logging.getLogger(__name__)
 
 _checkpointer = None
 _graph = None
+_db_conn = None  # shared SQLite connection for checkpoints + run_history
+
+
+def _get_db_conn() -> sqlite3.Connection:
+    """Return (creating if needed) a shared SQLite connection for this process."""
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+    db_path = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    _db_conn = sqlite3.connect(db_path, check_same_thread=False)
+    return _db_conn
 
 
 def _get_checkpointer():
@@ -49,17 +62,89 @@ def _get_checkpointer():
 
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
-        db_path = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        _checkpointer = SqliteSaver(conn)
-        logger.info("Checkpointer: SQLite at %s", db_path)
+        _checkpointer = SqliteSaver(_get_db_conn())
+        logger.info("Checkpointer: SQLite at %s", os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db"))
     except ImportError:
         from langgraph.checkpoint.memory import MemorySaver
         _checkpointer = MemorySaver()
         logger.warning("langgraph-checkpoint-sqlite not installed — using in-memory checkpointer")
 
     return _checkpointer
+
+
+# ── Run history (episodic memory) ─────────────────────────────────────────────
+
+def _ensure_history_table():
+    conn = _get_db_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_history (
+            run_id      TEXT PRIMARY KEY,
+            catalog     TEXT DEFAULT '',
+            schema_name TEXT DEFAULT '',
+            use_case    TEXT DEFAULT '',
+            status      TEXT DEFAULT '',
+            created_at  TEXT,
+            updated_at  TEXT
+        )
+    """)
+    conn.commit()
+
+
+def record_run_history(
+    run_id: str,
+    catalog: str = "",
+    schema: str = "",
+    use_case: str = "",
+    status: str = "",
+):
+    """
+    Upsert a run into run_history.
+    Preserves existing catalog/schema/use_case if new values are empty strings.
+    """
+    _ensure_history_table()
+    conn = _get_db_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO run_history (run_id, catalog, schema_name, use_case, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            catalog     = CASE WHEN excluded.catalog     != '' THEN excluded.catalog     ELSE catalog     END,
+            schema_name = CASE WHEN excluded.schema_name != '' THEN excluded.schema_name ELSE schema_name END,
+            use_case    = CASE WHEN excluded.use_case    != '' THEN excluded.use_case    ELSE use_case    END,
+            status      = excluded.status,
+            updated_at  = excluded.updated_at
+        """,
+        (run_id, catalog, schema, use_case, status, now, now),
+    )
+    conn.commit()
+
+
+def get_run_history(limit: int = 20) -> list[dict]:
+    """Return recent runs ordered by last update, newest first."""
+    _ensure_history_table()
+    conn = _get_db_conn()
+    rows = conn.execute(
+        """
+        SELECT run_id, catalog, schema_name, use_case, status, created_at, updated_at
+        FROM run_history
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "run_id": r[0],
+            "catalog": r[1],
+            "schema": r[2],
+            "use_case": r[3],
+            "status": r[4],
+            "created_at": r[5],
+            "updated_at": r[6],
+        }
+        for r in rows
+    ]
 
 
 def build_graph(checkpointer=None):
@@ -170,13 +255,16 @@ def run_discovery(
         graph.invoke(initial_state, config=config)
     except Exception as e:
         logger.error("Graph failed: %s", e)
+        record_run_history(run_id, catalog=catalog, schema=schema, status="error")
         return {"status": "error", "error": str(e), "run_id": run_id}
 
     snapshot = graph.get_state(config)
+    status = _snapshot_to_status(snapshot)
+    record_run_history(run_id, catalog=catalog, schema=schema, status=status)
 
     # tables are already plain dicts (converted in discover_catalog node)
     return {
-        "status": _snapshot_to_status(snapshot),
+        "status": status,
         "run_id": run_id,
         "opportunities": snapshot.values.get("opportunities", []),
         "tables": snapshot.values.get("tables", []),
