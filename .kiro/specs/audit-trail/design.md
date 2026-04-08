@@ -4,13 +4,16 @@
 
 The Audit Trail feature adds an immutable, hash-chained event log to every ML Accelerator run. It answers the enterprise compliance question: "what did the AI decide, who approved it, and when?" — without touching the LangGraph checkpoint or LangSmith traces.
 
-The design follows a fire-and-forget instrumentation pattern: a lightweight `AuditWriter` singleton is called at the end of each LangGraph node and at each FastAPI approval endpoint. Writes are dispatched as `asyncio` background tasks so they never block the pipeline. Events are stored in a Delta table (`ml_accelerator.audit_trail`) in Unity Catalog for production, with automatic SQLite fallback for local development. A `ChainVerifier` recomputes SHA-256 hashes to detect tampering. A new `GET /runs/{run_id}/audit` endpoint exposes the full ordered log.
+The design follows a fire-and-forget instrumentation pattern: a lightweight `AuditWriter` singleton is called at the end of each LangGraph node and at each FastAPI approval endpoint. Writes are dispatched as `asyncio` background tasks so they never block the pipeline. Events are stored in SQLite (`data/checkpoints.db`) — the same database already used for LangGraph checkpointing. A `ChainVerifier` recomputes SHA-256 hashes to detect tampering. A new `GET /runs/{run_id}/audit` endpoint exposes the full ordered log.
+
+> **Storage note:** This product generates and promotes ML notebooks — it does not run them. The `ml_accelerator` schema in Unity Catalog is written by the *generated notebooks* when the customer runs them on their cluster, not by this app. Therefore, Delta table storage for the audit trail is a **Phase 3 upgrade** (when the product is packaged as a full Databricks App with `databricks-connect`). For now, SQLite is the correct and only backend.
 
 ### Design Goals
 
 - Zero pipeline impact — audit instrumentation must be invisible to the agent's execution path
 - Tamper evidence — SHA-256 hash chaining makes any modification detectable
-- Dual-backend — same interface works against Delta (Databricks) and SQLite (local dev)
+- SQLite-first — no Spark, no cluster, no schema pre-creation required; works in the FastAPI process today
+- Delta-ready — `AuditStore` interface is backend-agnostic; Delta backend added in Phase 3 with `CREATE SCHEMA IF NOT EXISTS` guard
 - Complement, not duplicate — business events only; LangSmith owns LLM traces
 
 ---
@@ -40,8 +43,8 @@ graph TD
 
     subgraph AuditStore
         AS{Backend\nrouter}
-        AS -->|DATABRICKS_HOST set| DT[Delta Table\nml_accelerator.audit_trail]
-        AS -->|local dev| SQ[SQLite\ndata/checkpoints.db\naudit_trail table]
+        AS -->|Phase 3 upgrade| DT[Delta Table\nml_accelerator.audit_trail\nrequires databricks-connect]
+        AS -->|current - default| SQ[SQLite\ndata/checkpoints.db\naudit_trail table]
     end
 
     CV[ChainVerifier] --> AS
@@ -57,6 +60,8 @@ graph TD
 **Hash computation before write**: `event_hash` and `prev_hash` are computed synchronously before the background task is dispatched. This ensures the chain is logically correct even if writes arrive out of order at the store (sequence_number is the authoritative ordering key).
 
 **Sequence number assignment**: The `AuditWriter` maintains a per-run in-memory counter. On first emit for a run, it queries the store for the current max sequence_number and initialises the counter. Subsequent emits increment atomically. This avoids a round-trip per event while remaining correct across restarts (the counter is re-seeded from the store on first access after restart).
+
+**SQLite-first, Delta-ready**: The app generates notebooks but does not run them — `ml_accelerator` schema in Unity Catalog is created by the customer's cluster when they run the generated notebooks, not by this app. SQLite (`data/checkpoints.db`) is therefore the correct primary backend. The `AuditStore` interface is backend-agnostic so `DeltaAuditStore` can be added in Phase 3 without touching the writer or verifier. When Delta is added, `ensure_table()` must issue `CREATE SCHEMA IF NOT EXISTS {catalog}.ml_accelerator` before the table creation.
 
 **SQLite fallback detection**: Checked once at module import time via `os.getenv("DATABRICKS_HOST")`. The result is cached — no per-event environment check.
 
@@ -104,8 +109,8 @@ class AuditStore(Protocol):
 
 Two concrete implementations:
 
-- `DeltaAuditStore` — uses `spark.sql` INSERT INTO for writes, SELECT for reads
-- `SqliteAuditStore` — uses the existing `data/checkpoints.db` connection
+- `SqliteAuditStore` — uses the existing `data/checkpoints.db` connection. **Current default — no Spark required.**
+- `DeltaAuditStore` — uses `spark.sql` INSERT INTO for writes. **Phase 3 upgrade only.** Requires `databricks-connect` and `CREATE SCHEMA IF NOT EXISTS {catalog}.ml_accelerator` guard in `ensure_table()`.
 
 ### ChainVerifier
 

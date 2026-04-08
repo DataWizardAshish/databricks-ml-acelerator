@@ -39,15 +39,18 @@ All audit writes are fire-and-forget — the pipeline must never be blocked or b
     - Test `ensure_table()` is idempotent (call twice, no error)
     - _Requirements: 5.5_
 
-  - [ ] 2.3 Implement `DeltaAuditStore` in `audit/store.py`
+  - [ ] 2.3 Implement `DeltaAuditStore` in `audit/store.py` *(Phase 3 — skip for now)*
+    - Requires `databricks-connect` and an active Spark session
+    - `ensure_table()` must issue `CREATE SCHEMA IF NOT EXISTS {catalog}.ml_accelerator` before the table DDL
     - Uses `spark.sql` INSERT INTO for writes (payload JSON-serialized as string)
     - `ensure_table()` issues `CREATE TABLE IF NOT EXISTS ml_accelerator.audit_trail` with `TBLPROPERTIES ('delta.appendOnly' = 'true')`
     - `get_events()` uses `spark.sql` SELECT ordered by `sequence_number`
-    - _Requirements: 5.1, 5.2, 5.3, 5.4_
+    - _Requirements: 5.1, 5.2, 5.3, 5.4 — deferred to Phase 3_
 
   - [ ] 2.4 Implement `get_audit_store()` factory in `audit/store.py`
-    - Returns `DeltaAuditStore` when `os.getenv("DATABRICKS_HOST")` is set, else `SqliteAuditStore`
-    - Result is cached at module level (checked once at import time)
+    - Returns `SqliteAuditStore` always for now (Phase 3 will add Delta routing)
+    - Add a comment: `# Phase 3: return DeltaAuditStore when DATABRICKS_HOST set AND databricks-connect available`
+    - Result is cached at module level
     - _Requirements: 5.5, 5.6_
 
   - [ ]* 2.5 Write property test for append-only immutability (Property 5)
@@ -195,8 +198,8 @@ All audit writes are fire-and-forget — the pipeline must never be blocked or b
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for faster MVP
+- **Task 2.3 (DeltaAuditStore) is explicitly Phase 3** — skip it for now; SQLite is the correct backend until the app has `databricks-connect`
 - All `emit()` calls in nodes are wrapped in `try/except Exception: pass` — the pipeline must never be broken by audit instrumentation
 - Property tests use [Hypothesis](https://hypothesis.readthedocs.io/) with a minimum of 100 iterations each
 - `SqliteAuditStore` reuses the existing `data/checkpoints.db` connection — no new database files
-- `DeltaAuditStore` uses `spark.sql` INSERT INTO — never OVERWRITE or UPDATE
 - `run_id` is propagated into `state["workspace"]` in `run_discovery()` so all nodes can access it without state schema changes
