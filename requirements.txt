@@ -1,17 +1,25 @@
 # Core Databricks
 databricks-sdk>=0.40.0
-databricks-connect==15.4.*
 databricks-langchain>=0.4.0
+# databricks-connect==17.3.*  # local dev only — not needed inside Databricks Apps
 
 # LangGraph + LangChain
 langgraph>=0.3.0
 langgraph-checkpoint-sqlite>=2.0.0
+langgraph-checkpoint-postgres>=2.0.0
 langchain>=0.3.0
 langchain-core>=0.3.0
+
+# Lakebase (Postgres) — psycopg3 with connection pool for OAuth token rotation
+psycopg[binary,pool]>=3.1.0
+
+# SQL connector — OBO path for UC metadata queries (Path A auth)
+databricks-sql-connector>=3.0.0
 
 # API + UI
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+gunicorn>=22.0.0
 streamlit>=1.40.0
 
 # Config + utilities

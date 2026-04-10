@@ -17,6 +17,7 @@ Full graph:
 import logging
 import os
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
@@ -30,36 +31,211 @@ from agent.trust_nodes import (
     compute_risk_scorecard, generate_exec_summary,
 )
 from tools.workspace_context import WorkspaceContext, validate_workspace
+from audit.writer import get_audit_writer
 
 logger = logging.getLogger(__name__)
 
 _checkpointer = None
 _graph = None
+_db_conn = None  # shared SQLite connection for checkpoints + run_history
+
+
+def _get_db_conn() -> sqlite3.Connection:
+    """Return (creating if needed) a shared SQLite connection for this process."""
+    global _db_conn
+    if _db_conn is not None:
+        return _db_conn
+    db_path = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    _db_conn = sqlite3.connect(db_path, check_same_thread=False)
+    return _db_conn
 
 
 def _get_checkpointer():
     """
     Return a durable checkpointer.
-    SQLite (file-backed) for local dev — survives API restarts.
-    Falls back to MemorySaver if langgraph-checkpoint-sqlite is not installed.
+
+    Priority:
+      1. Lakebase (Postgres) — when LAKEBASE_ENDPOINT_NAME is set in config.
+         Uses psycopg3 ConnectionPool with OAuthConnection subclass so a fresh
+         Databricks OAuth token is fetched on every new pool connection.
+         Token rotation is fully automatic — no stored credentials.
+      2. SQLite (file-backed) — local dev fallback when Lakebase is not configured.
+         Survives API restarts; shares data/checkpoints.db with run_history + audit.
+      3. MemorySaver — last resort when neither package is installed.
     """
     global _checkpointer
     if _checkpointer is not None:
         return _checkpointer
 
+    settings = None
+    try:
+        from config.settings import get_settings
+        settings = get_settings()
+    except Exception:
+        pass
+
+    # ── 1. Lakebase (Postgres) ────────────────────────────────────────────────
+    if settings and settings.lakebase_endpoint_name and settings.lakebase_host:
+        try:
+            import psycopg
+            from psycopg_pool import ConnectionPool
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from databricks.sdk import WorkspaceClient
+
+            endpoint_name = settings.lakebase_endpoint_name
+            host = settings.lakebase_host
+            user = settings.lakebase_user
+            database = settings.lakebase_database
+
+            class OAuthConnection(psycopg.Connection):
+                """Fetches a fresh Databricks OAuth token on every new connection.
+                The pool calls connect() whenever it creates a new connection,
+                so tokens are rotated automatically — no 1-hour expiry issue.
+                Passes host/token explicitly so it works in local dev (PAT from
+                .env) and in Databricks Apps (platform-injected M2M credentials)."""
+                @classmethod
+                def connect(cls, conninfo="", **kwargs):
+                    import os
+                    w = WorkspaceClient(
+                        host=settings.databricks_host or os.environ.get("DATABRICKS_HOST") or None,
+                        config_file="/dev/null",   # ignore ~/.databrickscfg — use M2M from env only
+                    )
+                    credential = w.postgres.generate_database_credential(
+                        endpoint=endpoint_name
+                    )
+                    kwargs["password"] = credential.token
+                    return super().connect(conninfo, **kwargs)
+
+            pool = ConnectionPool(
+                conninfo=(
+                    f"dbname={database} user={user} "
+                    f"host={host} port=5432 sslmode=require"
+                ),
+                connection_class=OAuthConnection,
+                min_size=1,
+                max_size=5,
+                open=True,
+            )
+
+            # setup() runs CREATE INDEX CONCURRENTLY which requires autocommit —
+            # cannot run inside a transaction block (psycopg default).
+            # Use a one-shot direct connection for setup, then use the pool normally.
+            import os
+            w_setup = WorkspaceClient(
+                host=settings.databricks_host or os.environ.get("DATABRICKS_HOST") or None,
+                config_file="/dev/null",   # ignore ~/.databrickscfg — use M2M from env only
+            )
+            setup_cred = w_setup.postgres.generate_database_credential(endpoint=endpoint_name)
+            setup_conn = psycopg.connect(
+                host=host, port=5432, dbname=database,
+                user=user, password=setup_cred.token,
+                sslmode="require", autocommit=True,
+            )
+            PostgresSaver(setup_conn).setup()
+            setup_conn.close()
+
+            _checkpointer = PostgresSaver(pool)
+            logger.info("Checkpointer: Lakebase Postgres at %s", host)
+            return _checkpointer
+
+        except Exception as e:
+            logger.warning(
+                "Lakebase checkpointer init failed (%s) — falling back to SQLite", e
+            )
+
+    # ── 2. SQLite fallback ────────────────────────────────────────────────────
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
-        db_path = os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db")
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        _checkpointer = SqliteSaver(conn)
-        logger.info("Checkpointer: SQLite at %s", db_path)
+        _checkpointer = SqliteSaver(_get_db_conn())
+        logger.info(
+            "Checkpointer: SQLite at %s",
+            os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db"),
+        )
     except ImportError:
+        # ── 3. MemorySaver last resort ────────────────────────────────────────
         from langgraph.checkpoint.memory import MemorySaver
         _checkpointer = MemorySaver()
-        logger.warning("langgraph-checkpoint-sqlite not installed — using in-memory checkpointer")
+        logger.warning(
+            "langgraph-checkpoint-sqlite not installed — using in-memory checkpointer"
+        )
 
     return _checkpointer
+
+
+# ── Run history (episodic memory) ─────────────────────────────────────────────
+
+def _ensure_history_table():
+    conn = _get_db_conn()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_history (
+            run_id      TEXT PRIMARY KEY,
+            catalog     TEXT DEFAULT '',
+            schema_name TEXT DEFAULT '',
+            use_case    TEXT DEFAULT '',
+            status      TEXT DEFAULT '',
+            created_at  TEXT,
+            updated_at  TEXT
+        )
+    """)
+    conn.commit()
+
+
+def record_run_history(
+    run_id: str,
+    catalog: str = "",
+    schema: str = "",
+    use_case: str = "",
+    status: str = "",
+):
+    """
+    Upsert a run into run_history.
+    Preserves existing catalog/schema/use_case if new values are empty strings.
+    """
+    _ensure_history_table()
+    conn = _get_db_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO run_history (run_id, catalog, schema_name, use_case, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            catalog     = CASE WHEN excluded.catalog     != '' THEN excluded.catalog     ELSE catalog     END,
+            schema_name = CASE WHEN excluded.schema_name != '' THEN excluded.schema_name ELSE schema_name END,
+            use_case    = CASE WHEN excluded.use_case    != '' THEN excluded.use_case    ELSE use_case    END,
+            status      = excluded.status,
+            updated_at  = excluded.updated_at
+        """,
+        (run_id, catalog, schema, use_case, status, now, now),
+    )
+    conn.commit()
+
+
+def get_run_history(limit: int = 20) -> list[dict]:
+    """Return recent runs ordered by last update, newest first."""
+    _ensure_history_table()
+    conn = _get_db_conn()
+    rows = conn.execute(
+        """
+        SELECT run_id, catalog, schema_name, use_case, status, created_at, updated_at
+        FROM run_history
+        ORDER BY updated_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "run_id": r[0],
+            "catalog": r[1],
+            "schema": r[2],
+            "use_case": r[3],
+            "status": r[4],
+            "created_at": r[5],
+            "updated_at": r[6],
+        }
+        for r in rows
+    ]
 
 
 def build_graph(checkpointer=None):
@@ -145,9 +321,10 @@ def run_discovery(
     catalog: str = "",
     schema: str = "",
     cluster_id: str = "",
+    user_email: str = "",
 ) -> dict:
     """Start a full run. Returns after first human_checkpoint (opportunity approval)."""
-    ctx = WorkspaceContext(host=host, token=token, catalog=catalog, schema=schema, cluster_id=cluster_id)
+    ctx = WorkspaceContext(host=host, token=token, catalog=catalog, schema=schema, cluster_id=cluster_id, user_email=user_email)
 
     validation = validate_workspace(ctx)
     if not validation["valid"]:
@@ -155,7 +332,8 @@ def run_discovery(
 
     initial_state: AgentState = {
         # Store workspace as plain dict so state is JSON-serializable for SQLite checkpointer
-        "workspace": ctx.model_dump(),
+        # run_id included so nodes can access it for audit trail emission
+        "workspace": {**ctx.model_dump(), "run_id": run_id},
         "tables": [], "estate_summary": "",
         "opportunities": [], "approved_opportunity": None,
         "dry_run_plan": None, "risk_scorecard": None, "exec_summary": "",
@@ -170,13 +348,16 @@ def run_discovery(
         graph.invoke(initial_state, config=config)
     except Exception as e:
         logger.error("Graph failed: %s", e)
+        record_run_history(run_id, catalog=catalog, schema=schema, status="error")
         return {"status": "error", "error": str(e), "run_id": run_id}
 
     snapshot = graph.get_state(config)
+    status = _snapshot_to_status(snapshot)
+    record_run_history(run_id, catalog=catalog, schema=schema, status=status)
 
     # tables are already plain dicts (converted in discover_catalog node)
     return {
-        "status": _snapshot_to_status(snapshot),
+        "status": status,
         "run_id": run_id,
         "opportunities": snapshot.values.get("opportunities", []),
         "tables": snapshot.values.get("tables", []),
@@ -192,6 +373,23 @@ def approve_opportunity(run_id: str, selected_rank: int) -> dict:
     """
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
+
+    # Emit audit event BEFORE resuming — captured even if downstream graph fails
+    snapshot = graph.get_state(config)
+    approved_opp = None
+    if snapshot and snapshot.values:
+        opps = snapshot.values.get("opportunities", [])
+        approved_opp = next((o for o in opps if o["rank"] == selected_rank), opps[0] if opps else None)
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type="opportunity_approved",
+            actor="user",
+            node_name="human_checkpoint",
+            payload={"selected_rank": selected_rank, "approved_opportunity": approved_opp},
+        )
+    except Exception:
+        pass
 
     try:
         graph.invoke(Command(resume={"selected_rank": selected_rank}), config=config)
@@ -219,6 +417,17 @@ def confirm_dry_run(run_id: str) -> dict:
     """
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
+
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type="dry_run_confirmed",
+            actor="user",
+            node_name="dry_run_checkpoint",
+            payload={"confirmed": True},
+        )
+    except Exception:
+        pass
 
     try:
         graph.invoke(Command(resume={"confirmed": True}), config=config)
@@ -255,6 +464,21 @@ def approve_code(run_id: str, action: str = "approve", instructions: str = "") -
     """Resume from code review. Writes bundle + generates exec summary."""
     graph = _get_graph()
     config = {"configurable": {"thread_id": run_id}}
+
+    event_type = "code_approved" if action == "approve" else "code_regeneration_requested"
+    payload: dict = {"action": action}
+    if instructions:
+        payload["instructions"] = instructions
+    try:
+        get_audit_writer().emit(
+            run_id=run_id,
+            event_type=event_type,
+            actor="user",
+            node_name="human_checkpoint_code",
+            payload=payload,
+        )
+    except Exception:
+        pass
 
     try:
         graph.invoke(Command(resume={"action": action, "instructions": instructions}), config=config)

@@ -9,12 +9,26 @@ Flow:
   → Bundle Written + Full Exec Summary
 """
 
+import os
 import re
 
 import httpx
 import streamlit as st
 
-API_BASE = "http://localhost:8000"
+API_BASE = os.getenv("API_BASE", "http://localhost:8000")
+
+# ── OBO identity (Databricks Apps injects these headers per request) ──────────
+# st.context.headers is per-session; read once and cache in session_state.
+if "obo_email" not in st.session_state:
+    headers = getattr(st.context, "headers", {}) or {}
+    st.session_state.obo_email = headers.get("X-Forwarded-Email", "")
+    st.session_state.obo_token = headers.get("X-Forwarded-Access-Token", "")
+
+_OBO_HEADERS = {}
+if st.session_state.obo_email:
+    _OBO_HEADERS["X-Forwarded-Email"] = st.session_state.obo_email
+if st.session_state.obo_token:
+    _OBO_HEADERS["X-Forwarded-Access-Token"] = st.session_state.obo_token
 
 # ── Q&A guardrails ────────────────────────────────────────────────────────────
 # Checked client-side BEFORE any API/LLM call.
@@ -85,13 +99,13 @@ for k, v in _defaults.items():
 
 
 def api_get(path, params=None):
-    r = httpx.get(f"{API_BASE}{path}", params=params or {}, timeout=15)
+    r = httpx.get(f"{API_BASE}{path}", params=params or {}, headers=_OBO_HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
 
 def api_post(path, body=None, timeout=300):
-    r = httpx.post(f"{API_BASE}{path}", json=body or {}, timeout=timeout)
+    r = httpx.post(f"{API_BASE}{path}", json=body or {}, headers=_OBO_HEADERS, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
@@ -277,9 +291,18 @@ st.caption("Connect your Unity Catalog. Get production ML in days, not months.")
 # ── Sidebar: workspace connection ─────────────────────────────────────────────
 with st.sidebar:
     st.header("Workspace")
-    st.caption("Leave blank to use `~/.databrickscfg` DEFAULT profile.")
-    host = st.text_input("Workspace URL", placeholder="https://your-workspace.cloud.databricks.com")
-    token = st.text_input("Personal Access Token", type="password", placeholder="dapi...")
+
+    # In Databricks Apps, identity comes from SSO — no manual credentials needed.
+    # browse_* endpoints use the App's service principal (no token param needed).
+    # OBO token is only forwarded as a header for run-level actions via _OBO_HEADERS.
+    if st.session_state.obo_email:
+        st.success(f"Signed in as\n**{st.session_state.obo_email}**")
+        host = ""
+        token = ""   # browse uses App identity; OBO token goes as header, not query param
+    else:
+        st.caption("Leave blank to use `~/.databrickscfg` DEFAULT profile.")
+        host = st.text_input("Workspace URL", placeholder="https://your-workspace.cloud.databricks.com")
+        token = st.text_input("Personal Access Token", type="password", placeholder="dapi...")
 
     st.divider()
     if st.button("🔗 Connect & Browse"):
@@ -449,6 +472,40 @@ if current == 0:
                     st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
+
+    # ── Recent Runs (episodic memory) ─────────────────────────────────────────
+    _STATUS_BADGE = {
+        "awaiting_approval":            "🟡 Awaiting Approval",
+        "awaiting_dry_run_confirmation": "🟡 Dry Run",
+        "awaiting_code_review":         "🟡 Code Review",
+        "completed":                    "🟢 Complete",
+        "error":                        "🔴 Error",
+        "running":                      "🔵 Running",
+    }
+    try:
+        history_data = api_get("/runs/history")
+        recent_runs = history_data.get("runs", [])
+    except Exception:
+        recent_runs = []
+
+    if recent_runs:
+        st.divider()
+        st.subheader("Recent Runs")
+        for run in recent_runs:
+            with st.container(border=True):
+                c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 2, 1])
+                c1.caption(f"`{run['run_id'][:8]}…`")
+                c2.caption(f"`{run['catalog']}.{run['schema']}`")
+                c3.caption(run["use_case"] or "—")
+                c4.caption(_STATUS_BADGE.get(run["status"], run["status"]))
+                with c5:
+                    if st.button("Resume", key=f"resume_{run['run_id']}"):
+                        with st.spinner("Restoring run…"):
+                            if _try_rehydrate(run["run_id"]):
+                                st.query_params["run_id"] = run["run_id"]
+                                st.rerun()
+                            else:
+                                st.error("Could not restore this run.")
 
 
 # ── Step 2: Data Estate Overview ─────────────────────────────────────────────

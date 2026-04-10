@@ -8,6 +8,7 @@ Node flow:
 """
 
 import dataclasses
+import hashlib
 import json
 import logging
 
@@ -17,6 +18,7 @@ from langgraph.types import interrupt
 from tools.uc_reader import UCReader
 from tools.workspace_context import WorkspaceContext
 from agent.state import AgentState, MLOpportunity
+from audit.writer import get_audit_writer
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +130,25 @@ def rank_opportunities(state: AgentState) -> AgentState:
         return {**state, "error": f"LLM returned invalid JSON: {e}"}
 
     logger.info("Ranked %d opportunities", len(opportunities))
-    return {**state, "opportunities": opportunities}
+    new_state = {**state, "opportunities": opportunities}
+
+    try:
+        get_audit_writer().emit(
+            run_id=state["workspace"].get("run_id", ""),
+            event_type="opportunity_ranked",
+            actor="agent",
+            node_name="rank_opportunities",
+            payload={
+                "opportunities": opportunities,
+                "estate_summary_digest": hashlib.sha256(
+                    state.get("estate_summary", "").encode()
+                ).hexdigest(),
+            },
+        )
+    except Exception:
+        pass
+
+    return new_state
 
 
 # ── Node 4: Human Checkpoint ─────────────────────────────────────────────────

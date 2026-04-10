@@ -5,6 +5,7 @@ Endpoints:
   GET  /health
   GET  /browse/catalogs
   GET  /browse/schemas
+  GET  /runs/history                      — recent runs list (episodic memory)
   POST /runs                              — start discovery run
   GET  /runs/{run_id}                     — get run status
   GET  /runs/{run_id}/rehydrate           — restore full UI state from checkpoint (page refresh)
@@ -17,18 +18,34 @@ Endpoints:
 import logging
 import uuid
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agent.graph import (
     run_discovery, approve_opportunity, confirm_dry_run,
     approve_code, get_run_state, get_run_rehydrate,
+    record_run_history, get_run_history,
 )
 from tools.workspace_context import WorkspaceContext, list_catalogs, list_schemas
 from config.settings import get_settings
+from audit.store import get_audit_store
+from audit.verifier import ChainVerifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_current_user(request: Request) -> dict:
+    """
+    Extracts the end-user's identity from Databricks Apps OBO headers.
+    In Databricks Apps, these are injected by the platform for every request.
+    Falls back to empty strings in local dev (no headers present).
+    """
+    return {
+        "email": request.headers.get("X-Forwarded-Email", ""),
+        "token": request.headers.get("X-Forwarded-Access-Token", ""),
+    }
+
 
 app = FastAPI(
     title="Databricks ML Accelerator",
@@ -68,11 +85,19 @@ class AskRequest(BaseModel):
     step: str = "general"            # approve_opportunity | dry_run | code_review | done
 
 
+class AuditTrailResponse(BaseModel):
+    run_id: str
+    event_count: int
+    chain_valid: bool
+    events: list[dict]
+
+
 # ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health():
+def health(request: Request):
     settings = get_settings()
+    user = get_current_user(request)
     return {
         "status": "ok",
         "version": "0.4.0",
@@ -80,6 +105,7 @@ def health():
         "llm_endpoint": settings.llm_endpoint_name,
         "default_catalog": settings.uc_catalog,
         "default_schema": settings.uc_discovery_schema,
+        "authenticated_user": user["email"] or "local-dev",
     }
 
 
@@ -87,6 +113,10 @@ def health():
 
 @app.get("/browse/catalogs")
 def browse_catalogs(host: str = Query(default=""), token: str = Query(default="")):
+    # Browse uses the App's own identity (service principal in Apps, ~/.databrickscfg
+    # in local dev). OBO token is intentionally NOT used here — listing catalog
+    # metadata does not require acting as the end user, and OAuth JWTs must not be
+    # passed as query params (URL length + auth_type mismatch).
     ctx = WorkspaceContext(host=host, token=token)
     try:
         return {"catalogs": list_catalogs(ctx)}
@@ -109,17 +139,30 @@ def browse_schemas(
 
 # ── Runs ─────────────────────────────────────────────────────────────────────
 
+@app.get("/runs/history")
+def list_run_history(limit: int = Query(default=20, ge=1, le=100)):
+    """Return recent runs ordered by last update, newest first (episodic memory)."""
+    return {"runs": get_run_history(limit=limit)}
+
+
 @app.post("/runs", status_code=202)
-def start_run(body: StartRunRequest = StartRunRequest()):
+def start_run(request: Request, body: StartRunRequest = StartRunRequest()):
     """Start a new discovery + recommendation run (Phase 1)."""
+    user = get_current_user(request)
     run_id = str(uuid.uuid4())
-    logger.info("Starting run %s | catalog=%s schema=%s", run_id, body.catalog, body.schema)
+    # OBO token flows into WorkspaceContext.token and is used ONLY by get_sql_connection()
+    # (databricks.sql connector — Path A). It is never passed to get_workspace_client()
+    # (WorkspaceClient — Path B), which avoids the M2M + PAT auth conflict entirely.
+    token = body.workspace.token or user["token"]
+    user_email = user["email"]
+    logger.info("Starting run %s | user=%s catalog=%s schema=%s", run_id, user_email or "local-dev", body.catalog, body.schema)
     return run_discovery(
         run_id=run_id,
         host=body.workspace.host,
-        token=body.workspace.token,
+        token=token,
         catalog=body.catalog,
         schema=body.schema,
+        user_email=user_email,
     )
 
 
@@ -156,7 +199,11 @@ def approve_run(run_id: str, body: ApproveOpportunityRequest = ApproveOpportunit
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_approval'",
         )
-    return approve_opportunity(run_id=run_id, selected_rank=body.selected_rank)
+    result = approve_opportunity(run_id=run_id, selected_rank=body.selected_rank)
+    if result.get("approved_opportunity"):
+        use_case = result["approved_opportunity"].get("use_case", "")
+        record_run_history(run_id, use_case=use_case, status=result.get("status", ""))
+    return result
 
 
 @app.post("/runs/{run_id}/confirm-dry-run")
@@ -170,7 +217,9 @@ def confirm_dry_run_endpoint(run_id: str):
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_dry_run_confirmation'",
         )
-    return confirm_dry_run(run_id=run_id)
+    result = confirm_dry_run(run_id=run_id)
+    record_run_history(run_id, status=result.get("status", ""))
+    return result
 
 
 @app.post("/runs/{run_id}/approve-code")
@@ -184,7 +233,25 @@ def approve_run_code(run_id: str, body: ApproveCodeRequest = ApproveCodeRequest(
             status_code=400,
             detail=f"Run {run_id} status is '{state.get('status')}', expected 'awaiting_code_review'",
         )
-    return approve_code(run_id=run_id, action=body.action, instructions=body.instructions)
+    result = approve_code(run_id=run_id, action=body.action, instructions=body.instructions)
+    record_run_history(run_id, status=result.get("status", ""))
+    return result
+
+
+@app.get("/runs/{run_id}/audit", response_model=AuditTrailResponse)
+def get_audit_trail(run_id: str):
+    """Return the complete ordered audit trail for a run, with hash chain integrity check."""
+    store = get_audit_store()
+    events = store.get_events(run_id)
+    if not events:
+        raise HTTPException(status_code=404, detail=f"No audit trail found for run {run_id}")
+    result = ChainVerifier(store).verify(run_id)
+    return AuditTrailResponse(
+        run_id=run_id,
+        event_count=len(events),
+        chain_valid=result["valid"],
+        events=events,
+    )
 
 
 @app.post("/runs/{run_id}/ask")

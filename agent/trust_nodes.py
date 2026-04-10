@@ -18,6 +18,7 @@ from langgraph.types import interrupt
 from agent.state import AgentState, DryRunPlan, RiskScorecard, RiskScorecardItem
 from tools.bundle_writer import slugify, BUNDLES_ROOT
 from tools.workspace_context import WorkspaceContext
+from audit.writer import get_audit_writer
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,20 @@ def dry_run_explain(state: AgentState) -> AgentState:
             target_column_detail=f"Predicting {opp.get('target_column', 'target')}",
         )
 
-    return {**state, "dry_run_plan": plan}
+    new_state = {**state, "dry_run_plan": plan}
+
+    try:
+        get_audit_writer().emit(
+            run_id=state["workspace"].get("run_id", ""),
+            event_type="dry_run_planned",
+            actor="agent",
+            node_name="dry_run_explain",
+            payload={"dry_run_plan": plan},
+        )
+    except Exception:
+        pass
+
+    return new_state
 
 
 # ── Node 2: Business Brief (pre-code CTO summary) ─────────────────────────────
@@ -331,6 +345,18 @@ def compute_risk_scorecard(state: AgentState) -> AgentState:
     scorecard = RiskScorecard(items=items, overall=overall, summary=summary)
     logger.info("Risk scorecard: %s (%d pass, %d warn, %d fail)",
                 overall, len(items) - fail_count - warn_count, warn_count, fail_count)
+
+    try:
+        get_audit_writer().emit(
+            run_id=state["workspace"].get("run_id", ""),
+            event_type="risk_scorecard_computed",
+            actor="agent",
+            node_name="compute_risk_scorecard",
+            payload={"risk_scorecard": scorecard},
+        )
+    except Exception:
+        pass
+
     return {**state, "risk_scorecard": scorecard}
 
 
@@ -459,5 +485,17 @@ databricks bundle deploy --target prod
         logger.info("Executive summary written to %s", summary_path)
     except Exception as e:
         logger.warning("Could not write SUMMARY.md: %s", e)
+
+    try:
+        import hashlib as _hashlib
+        get_audit_writer().emit(
+            run_id=state["workspace"].get("run_id", ""),
+            event_type="exec_summary_generated",
+            actor="agent",
+            node_name="generate_exec_summary",
+            payload={"exec_summary_hash": _hashlib.sha256(summary_md.encode()).hexdigest()},
+        )
+    except Exception:
+        pass
 
     return {**state, "exec_summary": summary_md}
