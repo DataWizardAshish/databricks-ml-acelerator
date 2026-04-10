@@ -54,21 +54,111 @@ def _get_db_conn() -> sqlite3.Connection:
 def _get_checkpointer():
     """
     Return a durable checkpointer.
-    SQLite (file-backed) for local dev — survives API restarts.
-    Falls back to MemorySaver if langgraph-checkpoint-sqlite is not installed.
+
+    Priority:
+      1. Lakebase (Postgres) — when LAKEBASE_ENDPOINT_NAME is set in config.
+         Uses psycopg3 ConnectionPool with OAuthConnection subclass so a fresh
+         Databricks OAuth token is fetched on every new pool connection.
+         Token rotation is fully automatic — no stored credentials.
+      2. SQLite (file-backed) — local dev fallback when Lakebase is not configured.
+         Survives API restarts; shares data/checkpoints.db with run_history + audit.
+      3. MemorySaver — last resort when neither package is installed.
     """
     global _checkpointer
     if _checkpointer is not None:
         return _checkpointer
 
+    settings = None
+    try:
+        from config.settings import get_settings
+        settings = get_settings()
+    except Exception:
+        pass
+
+    # ── 1. Lakebase (Postgres) ────────────────────────────────────────────────
+    if settings and settings.lakebase_endpoint_name and settings.lakebase_host:
+        try:
+            import psycopg
+            from psycopg_pool import ConnectionPool
+            from langgraph.checkpoint.postgres import PostgresSaver
+            from databricks.sdk import WorkspaceClient
+
+            endpoint_name = settings.lakebase_endpoint_name
+            host = settings.lakebase_host
+            user = settings.lakebase_user
+            database = settings.lakebase_database
+
+            class OAuthConnection(psycopg.Connection):
+                """Fetches a fresh Databricks OAuth token on every new connection.
+                The pool calls connect() whenever it creates a new connection,
+                so tokens are rotated automatically — no 1-hour expiry issue.
+                Passes host/token explicitly so it works in local dev (PAT from
+                .env) and in Databricks Apps (platform-injected M2M credentials)."""
+                @classmethod
+                def connect(cls, conninfo="", **kwargs):
+                    import os
+                    w = WorkspaceClient(
+                        host=settings.databricks_host or os.environ.get("DATABRICKS_HOST") or None,
+                        config_file="/dev/null",   # ignore ~/.databrickscfg — use M2M from env only
+                    )
+                    credential = w.postgres.generate_database_credential(
+                        endpoint=endpoint_name
+                    )
+                    kwargs["password"] = credential.token
+                    return super().connect(conninfo, **kwargs)
+
+            pool = ConnectionPool(
+                conninfo=(
+                    f"dbname={database} user={user} "
+                    f"host={host} port=5432 sslmode=require"
+                ),
+                connection_class=OAuthConnection,
+                min_size=1,
+                max_size=5,
+                open=True,
+            )
+
+            # setup() runs CREATE INDEX CONCURRENTLY which requires autocommit —
+            # cannot run inside a transaction block (psycopg default).
+            # Use a one-shot direct connection for setup, then use the pool normally.
+            import os
+            w_setup = WorkspaceClient(
+                host=settings.databricks_host or os.environ.get("DATABRICKS_HOST") or None,
+                config_file="/dev/null",   # ignore ~/.databrickscfg — use M2M from env only
+            )
+            setup_cred = w_setup.postgres.generate_database_credential(endpoint=endpoint_name)
+            setup_conn = psycopg.connect(
+                host=host, port=5432, dbname=database,
+                user=user, password=setup_cred.token,
+                sslmode="require", autocommit=True,
+            )
+            PostgresSaver(setup_conn).setup()
+            setup_conn.close()
+
+            _checkpointer = PostgresSaver(pool)
+            logger.info("Checkpointer: Lakebase Postgres at %s", host)
+            return _checkpointer
+
+        except Exception as e:
+            logger.warning(
+                "Lakebase checkpointer init failed (%s) — falling back to SQLite", e
+            )
+
+    # ── 2. SQLite fallback ────────────────────────────────────────────────────
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
         _checkpointer = SqliteSaver(_get_db_conn())
-        logger.info("Checkpointer: SQLite at %s", os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db"))
+        logger.info(
+            "Checkpointer: SQLite at %s",
+            os.getenv("CHECKPOINT_DB_PATH", "./data/checkpoints.db"),
+        )
     except ImportError:
+        # ── 3. MemorySaver last resort ────────────────────────────────────────
         from langgraph.checkpoint.memory import MemorySaver
         _checkpointer = MemorySaver()
-        logger.warning("langgraph-checkpoint-sqlite not installed — using in-memory checkpointer")
+        logger.warning(
+            "langgraph-checkpoint-sqlite not installed — using in-memory checkpointer"
+        )
 
     return _checkpointer
 
@@ -231,9 +321,10 @@ def run_discovery(
     catalog: str = "",
     schema: str = "",
     cluster_id: str = "",
+    user_email: str = "",
 ) -> dict:
     """Start a full run. Returns after first human_checkpoint (opportunity approval)."""
-    ctx = WorkspaceContext(host=host, token=token, catalog=catalog, schema=schema, cluster_id=cluster_id)
+    ctx = WorkspaceContext(host=host, token=token, catalog=catalog, schema=schema, cluster_id=cluster_id, user_email=user_email)
 
     validation = validate_workspace(ctx)
     if not validation["valid"]:

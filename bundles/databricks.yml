@@ -11,7 +11,7 @@ bundle:
 variables:
   catalog:
     description: Unity Catalog catalog name
-    default: lakehouse_dev
+    default: dbw_vectoflow_dev
 
   schema:
     description: UC schema where ML artifacts are written
@@ -19,7 +19,7 @@ variables:
 
   cluster_id:
     description: All-purpose cluster ID for notebook execution
-    default: 1217-094102-xswsfzua
+    default: 0402-042550-3eto1bj6
 
   use_case_name:
     description: Slug for the approved ML use case (set by agent at generation time)
@@ -29,9 +29,9 @@ targets:
   dev:
     mode: development
     workspace:
-      host: https://adidas-dwhm-lh-wrk-gazelle-dev.cloud.databricks.com
+      host: https://adb-7405615862244533.13.azuredatabricks.net
     variables:
-      catalog: lakehouse_dev
+      catalog: dbw_vectoflow_dev
       schema: ml_accelerator
 
   prod:

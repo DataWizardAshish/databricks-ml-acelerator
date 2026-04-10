@@ -22,17 +22,27 @@ class Settings(BaseSettings):
     auth_type: Literal["pat", "oauth"] = "pat"
 
     # ── Compute ──────────────────────────────────────────────────────────────
-    databricks_cluster_id: str = "1217-094102-xswsfzua"
+    databricks_cluster_id: str = "0402-042550-3eto1bj6"
 
     # ── LLM ──────────────────────────────────────────────────────────────────
-    llm_endpoint_name: str = "ds-brand-funnel-ai_claude-sonnet-4-5_chat_dev"
+    llm_endpoint_name: str = "databricks-meta-llama-3-3-70b-instruct"
     llm_max_tokens: int = 4096
     llm_temperature: float = 0.0
 
     # ── Unity Catalog ────────────────────────────────────────────────────────
-    uc_catalog: str = "lakehouse_dev"
-    uc_discovery_schema: str = "ds_brand_funnel_ai_lhdev"
+    uc_catalog: str = "dbw_vectoflow_dev"
+    uc_discovery_schema: str = "vectoflow"
     uc_output_schema: str = "ml_accelerator"
+
+    # ── Lakebase (Postgres checkpointer) ─────────────────────────────────────
+    # Leave blank to fall back to SQLite (local dev without Lakebase)
+    # ── SQL Warehouse (OBO path — UC metadata queries run as end user) ───────────
+    sql_warehouse_id: str = ""         # e.g. cd22865cf1b63262
+
+    lakebase_endpoint_name: str = ""   # projects/ml-accelerator/branches/production/endpoints/primary
+    lakebase_host: str = ""            # ep-xxx.database.eastus.azuredatabricks.net
+    lakebase_user: str = ""            # your.email@domain.com or service-principal UUID
+    lakebase_database: str = "databricks_postgres"
 
     @model_validator(mode="after")
     def validate_auth(self) -> "Settings":

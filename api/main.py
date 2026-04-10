@@ -18,7 +18,7 @@ Endpoints:
 import logging
 import uuid
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agent.graph import (
@@ -33,6 +33,19 @@ from audit.verifier import ChainVerifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def get_current_user(request: Request) -> dict:
+    """
+    Extracts the end-user's identity from Databricks Apps OBO headers.
+    In Databricks Apps, these are injected by the platform for every request.
+    Falls back to empty strings in local dev (no headers present).
+    """
+    return {
+        "email": request.headers.get("X-Forwarded-Email", ""),
+        "token": request.headers.get("X-Forwarded-Access-Token", ""),
+    }
+
 
 app = FastAPI(
     title="Databricks ML Accelerator",
@@ -82,8 +95,9 @@ class AuditTrailResponse(BaseModel):
 # ── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health():
+def health(request: Request):
     settings = get_settings()
+    user = get_current_user(request)
     return {
         "status": "ok",
         "version": "0.4.0",
@@ -91,6 +105,7 @@ def health():
         "llm_endpoint": settings.llm_endpoint_name,
         "default_catalog": settings.uc_catalog,
         "default_schema": settings.uc_discovery_schema,
+        "authenticated_user": user["email"] or "local-dev",
     }
 
 
@@ -98,6 +113,10 @@ def health():
 
 @app.get("/browse/catalogs")
 def browse_catalogs(host: str = Query(default=""), token: str = Query(default="")):
+    # Browse uses the App's own identity (service principal in Apps, ~/.databrickscfg
+    # in local dev). OBO token is intentionally NOT used here — listing catalog
+    # metadata does not require acting as the end user, and OAuth JWTs must not be
+    # passed as query params (URL length + auth_type mismatch).
     ctx = WorkspaceContext(host=host, token=token)
     try:
         return {"catalogs": list_catalogs(ctx)}
@@ -127,16 +146,23 @@ def list_run_history(limit: int = Query(default=20, ge=1, le=100)):
 
 
 @app.post("/runs", status_code=202)
-def start_run(body: StartRunRequest = StartRunRequest()):
+def start_run(request: Request, body: StartRunRequest = StartRunRequest()):
     """Start a new discovery + recommendation run (Phase 1)."""
+    user = get_current_user(request)
     run_id = str(uuid.uuid4())
-    logger.info("Starting run %s | catalog=%s schema=%s", run_id, body.catalog, body.schema)
+    # OBO token flows into WorkspaceContext.token and is used ONLY by get_sql_connection()
+    # (databricks.sql connector — Path A). It is never passed to get_workspace_client()
+    # (WorkspaceClient — Path B), which avoids the M2M + PAT auth conflict entirely.
+    token = body.workspace.token or user["token"]
+    user_email = user["email"]
+    logger.info("Starting run %s | user=%s catalog=%s schema=%s", run_id, user_email or "local-dev", body.catalog, body.schema)
     return run_discovery(
         run_id=run_id,
         host=body.workspace.host,
-        token=body.workspace.token,
+        token=token,
         catalog=body.catalog,
         schema=body.schema,
+        user_email=user_email,
     )
 
 
